@@ -819,6 +819,7 @@ ifdef CONFIG_READABLE_ASM
 # partial inlining inlines only parts of functions
 KBUILD_CFLAGS += -fno-reorder-blocks -fno-ipa-cp-clone -fno-partial-inlining
 endif
+KBUILD_CFLAGS += $(call cc-option,-Wno-frame-larger-than=)
 
 ifneq ($(CONFIG_FRAME_WARN),0)
 KBUILD_CFLAGS += -Wframe-larger-than=$(CONFIG_FRAME_WARN)
