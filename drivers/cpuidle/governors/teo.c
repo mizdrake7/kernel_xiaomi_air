@@ -112,6 +112,12 @@
 #define LATENCY_THRESHOLD_NS	(RESIDENCY_THRESHOLD_NS / 2)
 
 /*
+ * Idle state exit latency threshold used for deciding whether or not to check
+ * the time till the closest expected timer event.
+ */
+#define LATENCY_THRESHOLD_NS	(RESIDENCY_THRESHOLD_NS / 2)
+
+/*
  * The PULSE value is added to metrics when they grow and the DECAY_SHIFT value
  * is used for decreasing metrics on a regular basis.
  */
