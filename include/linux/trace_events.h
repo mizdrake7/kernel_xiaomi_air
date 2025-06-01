@@ -805,6 +805,8 @@ int trace_array_set_clr_event(struct trace_array *tr, const char *system,
  * if we try to allocate the static variable to fmt if it is not a
  * constant. Even with the outer if statement optimizing out.
  */
+
+#ifdef TRACING
 #define event_trace_printk(ip, fmt, args...)				\
 do {									\
 	__trace_printk_check_format(fmt, ##args);			\
@@ -818,6 +820,10 @@ do {									\
 	} else								\
 		__trace_printk(ip, fmt, ##args);			\
 } while (0)
+
+#else
+#define event_trace_printk(ip, fmt, args...) ((void)0)
+#endif
 
 #ifdef CONFIG_PERF_EVENTS
 struct perf_event;
