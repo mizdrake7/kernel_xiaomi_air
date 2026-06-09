@@ -741,6 +741,11 @@ static ssize_t devkmsg_write(struct kiocb *iocb, struct iov_iter *from)
 		char *endp = NULL;
 		unsigned int u;
 
+		if (!memcmp(line + 3, "batteryd", sizeof("batteryd") - 1) ||
+        	    !memcmp(line + 3, "healthd", sizeof("healthd") - 1)) {
+			return ret;
+		}
+
 		u = simple_strtoul(line + 1, &endp, 10);
 		if (endp && endp[0] == '>') {
 			level = LOG_LEVEL(u);
@@ -749,7 +754,7 @@ static ssize_t devkmsg_write(struct kiocb *iocb, struct iov_iter *from)
 			endp++;
 			line = endp;
 			if (strstr(line, "healthd") ||
-				strncmp(line, "logd: Skipping", sizeof("logd: Skipping")))
+				!strncmp(line, "logd: Skipping", sizeof("logd: Skipping")))
 				return ret;
 		}
 	}
