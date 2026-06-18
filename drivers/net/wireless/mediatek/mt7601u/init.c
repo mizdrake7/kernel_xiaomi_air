@@ -589,10 +589,12 @@ int mt7601u_register_device(struct mt7601u_dev *dev)
 		return -ENOMEM;
 	dev->mon_wcid->idx = 0xff;
 	dev->mon_wcid->hw_key_idx = -1;
+    dev->mon_wcid->tx_rate_set = false;
 
 	SET_IEEE80211_DEV(hw, dev->dev);
 
 	hw->queues = 4;
+    hw->extra_tx_headroom = sizeof(struct mt76_txwi) + 32;
 	ieee80211_hw_set(hw, SIGNAL_DBM);
 	ieee80211_hw_set(hw, PS_NULLFUNC_STACK);
 	ieee80211_hw_set(hw, SUPPORTS_HT_CCK_RATES);
@@ -609,7 +611,9 @@ int mt7601u_register_device(struct mt7601u_dev *dev)
 	SET_IEEE80211_PERM_ADDR(hw, dev->macaddr);
 
 	wiphy->features |= NL80211_FEATURE_ACTIVE_MONITOR;
-	wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
+	wiphy->interface_modes =
+        BIT(NL80211_IFTYPE_STATION) |
+        BIT(NL80211_IFTYPE_MONITOR);
 	wiphy->flags |= WIPHY_FLAG_SUPPORTS_TDLS;
 
 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_CQM_RSSI_LIST);

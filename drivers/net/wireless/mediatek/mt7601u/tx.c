@@ -143,6 +143,16 @@ mt7601u_push_txwi(struct mt7601u_dev *dev, struct sk_buff *skb,
 	txwi = skb_push(skb, sizeof(struct mt76_txwi));
 	memset(txwi, 0, sizeof(*txwi));
 
+        if (info->flags & IEEE80211_TX_CTL_INJECTED) {
+        txwi->wcid = dev->mon_wcid->idx;
+        txwi->ack_ctl = 0;
+        txwi->flags |=
+                cpu_to_le16(
+                        MT_TXWI_FLAGS_NO_RATE_FALLBACK);
+        txwi->len_ctl = cpu_to_le16(pkt_len);
+        return txwi;
+}
+
 	if (!wcid->tx_rate_set)
 		ieee80211_get_tx_rates(info->control.vif, sta, skb,
 				       info->control.rates, 1);
@@ -208,14 +218,19 @@ void mt7601u_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *control,
 		return;
 	}
 
-	if (sta) {
-		msta = (struct mt76_sta *) sta->drv_priv;
-		wcid = &msta->wcid;
-	} else if (vif) {
-		struct mt76_vif *mvif = (struct mt76_vif *)vif->drv_priv;
 
-		wcid = &mvif->group_wcid;
-	}
+
+	if (info->flags & IEEE80211_TX_CTL_INJECTED) {
+        sta = NULL;
+        wcid = dev->mon_wcid;
+} else if (sta) {
+        msta = (struct mt76_sta *)sta->drv_priv;
+        wcid = &msta->wcid;
+} else if (vif) {
+        struct mt76_vif *mvif =
+                (struct mt76_vif *)vif->drv_priv;
+        wcid = &mvif->group_wcid;
+}
 
 	txwi = mt7601u_push_txwi(dev, skb, sta, wcid, pkt_len);
 
