@@ -60,7 +60,7 @@
 	pr_debug(GED_KPI_TAG"%s %d : "fmt, __func__, __LINE__, ##args)
 
 #define GED_KPI_SEC_DIVIDER 1000000000
-#define GED_KPI_MAX_FPS 60
+#define GED_KPI_MAX_FPS 120
 /* set default margin to be distinct from FPSGO(0 or 3) */
 #define GED_KPI_DEFAULT_FPS_MARGIN 4
 #define GED_KPI_CPU_MAX_OPP 0
