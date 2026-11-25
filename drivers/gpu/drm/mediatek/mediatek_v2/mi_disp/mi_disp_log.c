@@ -642,8 +642,10 @@ int mi_disp_log_init(void)
 
 	return 0;
 
+#ifdef CONFIG_MI_DISP_DEBUGFS
 err_dev_destroy:
 	device_destroy(disp_log->class, disp_log->dev_id);
+#endif
 err_cdev_unreg:
 	mi_disp_cdev_unregister(disp_log->cdev);
 err_free_mem:

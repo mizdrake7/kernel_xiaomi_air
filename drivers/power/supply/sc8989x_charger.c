@@ -2878,7 +2878,7 @@ static int sc8989x_charger_remove(struct i2c_client *client)
     return 0;
 }
 
-static int get_ship_mode()
+static int get_ship_mode(void)
 {
     struct power_supply *psy = NULL;
     struct mtk_battery *gm = NULL;

@@ -859,6 +859,19 @@ KBUILD_CFLAGS += $(call cc-disable-warning, unused-const-variable)
 
 # These result in bogus false positives
 KBUILD_CFLAGS += $(call cc-disable-warning, dangling-pointer)
+KBUILD_CFLAGS += $(call cc-disable-warning, default-const-init-unsafe)
+KBUILD_CFLAGS += $(call cc-disable-warning, default-const-init-var-unsafe)
+KBUILD_CFLAGS += $(call cc-disable-warning, default-const-init-field-unsafe)
+KBUILD_CFLAGS += $(call cc-disable-warning, uninitialized-const-pointer)
+ifneq ($(KBUILD_EXTMOD),)
+KBUILD_CFLAGS += $(call cc-disable-warning, strict-prototypes)
+KBUILD_CFLAGS += $(call cc-disable-warning, implicit-int)
+KBUILD_CFLAGS += $(call cc-disable-warning, int-conversion)
+KBUILD_CFLAGS += $(call cc-disable-warning, unused-function)
+KBUILD_CFLAGS += $(call cc-disable-warning, unused-variable)
+KBUILD_CFLAGS += $(call cc-disable-warning, sometimes-uninitialized)
+KBUILD_CFLAGS += $(call cc-disable-warning, enum-compare)
+endif
 
 ifdef CONFIG_FRAME_POINTER
 KBUILD_CFLAGS	+= -fno-omit-frame-pointer -fno-optimize-sibling-calls

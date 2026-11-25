@@ -23,7 +23,7 @@
 const struct apupwr_plat_data *pwr_data;
 
 struct platform_device *this_pdev;
-static struct apupwr_dbg aputop_dbg;
+static struct apupwr_dbg aputop_dbg __maybe_unused;
 static int aputop_func_sel;
 static DEFINE_MUTEX(aputop_func_mtx);
 #if IS_ENABLED(CONFIG_PM_SLEEP)
@@ -315,6 +315,15 @@ int aputop_dbg_init(struct apusys_core_info *info)
 void aputop_dbg_exit(void)
 {
 	debugfs_remove(aputop_dbg.file);
+}
+#else
+int aputop_dbg_init(struct apusys_core_info *info)
+{
+	return 0;
+}
+
+void aputop_dbg_exit(void)
+{
 }
 #endif
 

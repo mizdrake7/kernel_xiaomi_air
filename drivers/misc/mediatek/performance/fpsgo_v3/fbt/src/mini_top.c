@@ -74,7 +74,7 @@ static void minitop_trace(const char *fmt, ...)
 	if (unlikely(len == 256))
 		log[255] = '\0';
 	va_end(args);
-	trace_printk(log);
+	trace_printk("%s", log);
 }
 
 static int __util_cmp(const void *a, const void *b)

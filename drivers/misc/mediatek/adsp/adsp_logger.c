@@ -168,7 +168,7 @@ static void adsp_logger_init_handler(int id, void *data, unsigned int len)
 	unsigned int *ptr = (unsigned int *)data;
 	unsigned int delay = 0;
 
-	struct adsp_priv *pdata = get_adsp_core_by_id(*ptr);
+	struct adsp_priv *pdata __maybe_unused = get_adsp_core_by_id(*ptr);
 
 	if (len > sizeof(unsigned int)) {
 		/* sync error, show error message, add delay for re-sync */

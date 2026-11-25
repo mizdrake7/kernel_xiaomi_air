@@ -4600,8 +4600,8 @@ static int fbt_get_cl_loading_exp(int pid, unsigned long long buffer_id,
 	unsigned long long loading_result = 0U;
 	unsigned long long prev_ts, next_ts, new_ts_100us;
 	unsigned long long render_last_cb_ts, freq_last_cb_ts;
-	unsigned long long *cpu_freq_ts_prev, *cpu_freq_ts_next;
-	unsigned int *cpu_obv, *cpu_isolated, cpy_current_cl_obv;
+	unsigned long long *cpu_freq_ts_prev = NULL, *cpu_freq_ts_next = NULL;
+	unsigned int *cpu_obv = NULL, *cpu_isolated = NULL, cpy_current_cl_obv;
 
 	new_ts_100us = ts_100us;
 

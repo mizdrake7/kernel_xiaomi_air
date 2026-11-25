@@ -91,7 +91,7 @@ static void _opp_limiter(int vpu_max, int vpu_min, int dla_max, int dla_min,
 
 }
 
-static void limit_opp_to_all_devices(int opp)
+static void __maybe_unused limit_opp_to_all_devices(int opp)
 {
 	int c_id, d_id;
 

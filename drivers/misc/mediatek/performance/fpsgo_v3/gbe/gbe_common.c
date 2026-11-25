@@ -69,7 +69,7 @@ void gbe_trace_printk(int pid, char *module, char *string)
 	else if (unlikely(len == 256))
 		buf2[255] = '\0';
 
-	trace_printk(buf2);
+	trace_printk("%s", buf2);
 }
 
 struct k_list {

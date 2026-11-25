@@ -2094,7 +2094,7 @@ int tcpc_typec_handle_wd(struct tcpc_device **tcpcs, size_t nr, bool wd)
 	if (nr < 1)
 		return ret;
 	tcpc = tcpcs[0];
-	TYPEC_INFO("%s %d, nr = %d\n", __func__, wd, nr);
+	TYPEC_INFO("%s %d, nr = %zu\n", __func__, wd, nr);
 
 	if (tcpc->bootmode == 8 || tcpc->bootmode == 9) {
 		TYPEC_INFO("KPOC does not enter/exit water protection\n");

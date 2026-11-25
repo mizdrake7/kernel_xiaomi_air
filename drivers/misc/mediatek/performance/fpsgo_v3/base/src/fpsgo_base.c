@@ -303,7 +303,7 @@ static int fpsgo_update_tracemark(void)
 
 static noinline int tracing_mark_write(const char *buf)
 {
-	trace_printk(buf);
+	trace_printk("%s", buf);
 	return 0;
 }
 
@@ -403,7 +403,7 @@ void fpsgo_main_trace(const char *fmt, ...)
 	if (unlikely(len == 256))
 		log[255] = '\0';
 	va_end(args);
-	trace_printk(log);
+	trace_printk("%s", log);
 }
 EXPORT_SYMBOL(fpsgo_main_trace);
 

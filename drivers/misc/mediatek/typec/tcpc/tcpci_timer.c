@@ -288,7 +288,7 @@ void tcpc_enable_lpm_timer(struct tcpc_device *tcpc, bool en)
 		if (tout > 300 * USEC_PER_SEC)
 			tout = 300 * USEC_PER_SEC;
 		tcpc->typec_lpm_tout = tout;
-		TCPC_TIMER_DBG("%s tout = %dms\n", __func__,
+		TCPC_TIMER_DBG("%s tout = %ldms\n", __func__,
 						   tout / USEC_PER_MSEC);
 		r = tout / USEC_PER_SEC;
 		mod = tout % USEC_PER_SEC;

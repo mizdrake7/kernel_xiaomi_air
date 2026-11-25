@@ -180,7 +180,7 @@ void xgf_trace(const char *fmt, ...)
 	if (unlikely(len == 256))
 		log[255] = '\0';
 	va_end(args);
-	trace_printk(log);
+	trace_printk("%s", log);
 }
 EXPORT_SYMBOL(xgf_trace);
 
@@ -2006,7 +2006,7 @@ static void xgf_log_trace(const char *fmt, ...)
 	if (unlikely(len == 1024))
 		log[1023] = '\0';
 	va_end(args);
-	trace_printk(log);
+	trace_printk("%s", log);
 }
 
 static void xgf_print_critical_path_info(struct xgf_render *r)

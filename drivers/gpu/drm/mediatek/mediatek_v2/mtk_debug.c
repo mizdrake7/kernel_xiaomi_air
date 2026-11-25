@@ -9,8 +9,8 @@
 #include <linux/wait.h>
 #if IS_ENABLED(CONFIG_DEBUG_FS)
 #include <linux/debugfs.h>
-#include <mt-plat/mrdump.h>
 #endif
+#include <mt-plat/mrdump.h>
 #include <linux/panic_notifier.h>
 #include <linux/kdebug.h>
 
