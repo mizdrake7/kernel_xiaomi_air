@@ -27,13 +27,13 @@ if [ -z "$KBUILD_BUILD_TIMESTAMP" ]; then
 else
 	TIMESTAMP=$KBUILD_BUILD_TIMESTAMP
 fi
-if test -z "$KBUILD_BUILD_USER"; then
-	LINUX_COMPILE_BY=$(whoami | sed 's/\\/\\\\/')
+if test -z "$KBUILD_BUILD_USER" || test "$KBUILD_BUILD_USER" = "build-user"; then
+	LINUX_COMPILE_BY=MAdMiZ
 else
 	LINUX_COMPILE_BY=$KBUILD_BUILD_USER
 fi
-if test -z "$KBUILD_BUILD_HOST"; then
-	LINUX_COMPILE_HOST=`uname -n`
+if test -z "$KBUILD_BUILD_HOST" || test "$KBUILD_BUILD_HOST" = "build-host"; then
+	LINUX_COMPILE_HOST=Kali
 else
 	LINUX_COMPILE_HOST=$KBUILD_BUILD_HOST
 fi
