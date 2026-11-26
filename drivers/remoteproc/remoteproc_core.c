@@ -692,6 +692,9 @@ static int rproc_handle_trace(struct rproc *rproc, void *ptr,
 		return -EINVAL;
 	}
 
+	/* keep the name for the diagnostic in rproc_trace_read() */
+	strscpy(trace->trace_mem.name, name, sizeof(trace->trace_mem.name));
+
 	list_add_tail(&trace->node, &rproc->traces);
 
 	rproc->num_traces++;
@@ -1161,60 +1164,55 @@ static rproc_handle_resource_t rproc_loading_handlers[RSC_LAST] = {
 	[RSC_VDEV] = rproc_handle_vdev,
 };
 
+struct rproc_rsc_cb_data {
+	struct rproc *rproc;
+	rproc_handle_resource_t *handlers;
+};
+
+static int rproc_handle_rsc_entry(u32 type, void *rsc, int offset,
+				  int avail, void *data)
+{
+	struct rproc_rsc_cb_data *d = data;
+	struct rproc *rproc = d->rproc;
+	struct device *dev = &rproc->dev;
+	rproc_handle_resource_t handler;
+	int ret;
+
+	dev_dbg(dev, "rsc: type %d\n", type);
+
+	if (type >= RSC_VENDOR_START && type <= RSC_VENDOR_END) {
+		ret = rproc_handle_rsc(rproc, type, rsc, offset, avail);
+		if (ret == RSC_HANDLED)
+			return 0;
+		if (ret < 0)
+			return ret;
+		dev_warn(dev, "unsupported vendor resource %d\n", type);
+		return 0;
+	}
+
+	if (type >= RSC_LAST) {
+		dev_warn(dev, "unsupported resource %d\n", type);
+		return 0;
+	}
+
+	handler = d->handlers[type];
+	if (!handler)
+		return 0;
+
+	return handler(rproc, rsc, offset, avail);
+}
+
 /* handle firmware resource entries before booting the remote processor */
 static int rproc_handle_resources(struct rproc *rproc,
 				  rproc_handle_resource_t handlers[RSC_LAST])
 {
-	struct device *dev = &rproc->dev;
-	rproc_handle_resource_t handler;
-	int ret = 0, i;
+	struct rproc_rsc_cb_data d = { .rproc = rproc, .handlers = handlers };
 
 	if (!rproc->table_ptr)
 		return 0;
 
-	for (i = 0; i < rproc->table_ptr->num; i++) {
-		int offset = rproc->table_ptr->offset[i];
-		struct fw_rsc_hdr *hdr = (void *)rproc->table_ptr + offset;
-		int avail = rproc->table_sz - offset - sizeof(*hdr);
-		void *rsc = (void *)hdr + sizeof(*hdr);
-
-		/* make sure table isn't truncated */
-		if (avail < 0) {
-			dev_err(dev, "rsc table is truncated\n");
-			return -EINVAL;
-		}
-
-		dev_dbg(dev, "rsc: type %d\n", hdr->type);
-
-		if (hdr->type >= RSC_VENDOR_START &&
-		    hdr->type <= RSC_VENDOR_END) {
-			ret = rproc_handle_rsc(rproc, hdr->type, rsc,
-					       offset + sizeof(*hdr), avail);
-			if (ret == RSC_HANDLED)
-				continue;
-			else if (ret < 0)
-				break;
-
-			dev_warn(dev, "unsupported vendor resource %d\n",
-				 hdr->type);
-			continue;
-		}
-
-		if (hdr->type >= RSC_LAST) {
-			dev_warn(dev, "unsupported resource %d\n", hdr->type);
-			continue;
-		}
-
-		handler = handlers[hdr->type];
-		if (!handler)
-			continue;
-
-		ret = handler(rproc, rsc, offset + sizeof(*hdr), avail);
-		if (ret)
-			break;
-	}
-
-	return ret;
+	return rsc_table_for_each_entry(rproc->table_ptr, rproc->table_sz,
+					&rproc->dev, rproc_handle_rsc_entry, &d);
 }
 
 static int rproc_prepare_subdevices(struct rproc *rproc)
@@ -1762,7 +1760,7 @@ static int rproc_attach(struct rproc *rproc)
 	ret = rproc_set_rsc_table(rproc);
 	if (ret) {
 		dev_err(dev, "can't load resource table: %d\n", ret);
-		goto unprepare_device;
+		goto clean_up_resources;
 	}
 
 	/* reset max_notifyid */
@@ -1779,7 +1777,7 @@ static int rproc_attach(struct rproc *rproc)
 	ret = rproc_handle_resources(rproc, rproc_loading_handlers);
 	if (ret) {
 		dev_err(dev, "Failed to process resources: %d\n", ret);
-		goto unprepare_device;
+		goto clean_up_resources;
 	}
 
 	/* Allocate carveout resources associated to rproc */
@@ -1798,9 +1796,9 @@ static int rproc_attach(struct rproc *rproc)
 
 clean_up_resources:
 	rproc_resource_cleanup(rproc);
-unprepare_device:
 	/* release HW resources if needed */
 	rproc_unprepare_device(rproc);
+	kfree(rproc->clean_table);
 disable_iommu:
 	rproc_disable_iommu(rproc);
 	return ret;
@@ -2461,6 +2459,7 @@ int rproc_add(struct rproc *rproc)
 	return 0;
 
 rproc_remove_dev:
+	cancel_work_sync(&rproc->crash_handler);
 	rproc_delete_debug_dir(rproc);
 	device_del(dev);
 rproc_remove_cdev:

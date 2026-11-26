@@ -278,7 +278,7 @@ static int vce_v2_0_stop(struct amdgpu_device *adev)
 	int status;
 
 	if (vce_v2_0_lmi_clean(adev)) {
-		DRM_INFO("vce is not idle \n");
+		DRM_INFO("VCE is not idle \n");
 		return 0;
 	}
 
@@ -467,12 +467,16 @@ static int vce_v2_0_hw_init(void *handle)
 	for (i = 0; i < adev->vce.num_rings; i++) {
 		r = amdgpu_ring_test_helper(&adev->vce.ring[i]);
 		if (r)
-			return r;
+			goto error;
 	}
 
 	DRM_INFO("VCE initialized successfully.\n");
 
 	return 0;
+
+error:
+	cancel_delayed_work_sync(&adev->vce.idle_work);
+	return r;
 }
 
 static int vce_v2_0_hw_fini(void *handle)

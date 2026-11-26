@@ -287,37 +287,6 @@ static int ice_check_vf_init(struct ice_pf *pf, struct ice_vf *vf)
 }
 
 /**
- * ice_err_to_virt_err - translate errors for VF return code
- * @ice_err: error return code
- */
-static enum virtchnl_status_code ice_err_to_virt_err(enum ice_status ice_err)
-{
-	switch (ice_err) {
-	case ICE_SUCCESS:
-		return VIRTCHNL_STATUS_SUCCESS;
-	case ICE_ERR_BAD_PTR:
-	case ICE_ERR_INVAL_SIZE:
-	case ICE_ERR_DEVICE_NOT_SUPPORTED:
-	case ICE_ERR_PARAM:
-	case ICE_ERR_CFG:
-		return VIRTCHNL_STATUS_ERR_PARAM;
-	case ICE_ERR_NO_MEMORY:
-		return VIRTCHNL_STATUS_ERR_NO_MEMORY;
-	case ICE_ERR_NOT_READY:
-	case ICE_ERR_RESET_FAILED:
-	case ICE_ERR_FW_API_VER:
-	case ICE_ERR_AQ_ERROR:
-	case ICE_ERR_AQ_TIMEOUT:
-	case ICE_ERR_AQ_FULL:
-	case ICE_ERR_AQ_NO_WORK:
-	case ICE_ERR_AQ_EMPTY:
-		return VIRTCHNL_STATUS_ERR_ADMIN_QUEUE_ERROR;
-	default:
-		return VIRTCHNL_STATUS_ERR_NOT_SUPPORTED;
-	}
-}
-
-/**
  * ice_vc_vf_broadcast - Broadcast a message to all VFs on PF
  * @pf: pointer to the PF structure
  * @v_opcode: operation code
@@ -1301,45 +1270,50 @@ static void ice_clear_vf_reset_trigger(struct ice_vf *vf)
 	ice_flush(hw);
 }
 
-/**
- * ice_vf_set_vsi_promisc - set given VF VSI to given promiscuous mode(s)
- * @vf: pointer to the VF info
- * @vsi: the VSI being configured
- * @promisc_m: mask of promiscuous config bits
- * @rm_promisc: promisc flag request from the VF to remove or add filter
- *
- * This function configures VF VSI promiscuous mode, based on the VF requests,
- * for Unicast, Multicast and VLAN
- */
-static enum ice_status
-ice_vf_set_vsi_promisc(struct ice_vf *vf, struct ice_vsi *vsi, u8 promisc_m,
-		       bool rm_promisc)
+static int
+ice_vf_set_vsi_promisc(struct ice_vf *vf, struct ice_vsi *vsi, u8 promisc_m)
 {
-	struct ice_pf *pf = vf->pf;
-	enum ice_status status = 0;
-	struct ice_hw *hw;
+	struct ice_hw *hw = &vsi->back->hw;
+	enum ice_status status;
 
-	hw = &pf->hw;
-	if (vsi->num_vlan) {
-		status = ice_set_vlan_vsi_promisc(hw, vsi->idx, promisc_m,
-						  rm_promisc);
-	} else if (vf->port_vlan_info) {
-		if (rm_promisc)
-			status = ice_clear_vsi_promisc(hw, vsi->idx, promisc_m,
-						       vf->port_vlan_info);
-		else
-			status = ice_set_vsi_promisc(hw, vsi->idx, promisc_m,
-						     vf->port_vlan_info);
-	} else {
-		if (rm_promisc)
-			status = ice_clear_vsi_promisc(hw, vsi->idx, promisc_m,
-						       0);
-		else
-			status = ice_set_vsi_promisc(hw, vsi->idx, promisc_m,
-						     0);
+	if (vf->port_vlan_info)
+		status = ice_fltr_set_vsi_promisc(hw, vsi->idx, promisc_m,
+						  vf->port_vlan_info & VLAN_VID_MASK);
+	else if (vsi->num_vlan > 1)
+		status = ice_fltr_set_vlan_vsi_promisc(hw, vsi, promisc_m);
+	else
+		status = ice_fltr_set_vsi_promisc(hw, vsi->idx, promisc_m, 0);
+
+	if (status && status != ICE_ERR_ALREADY_EXISTS) {
+		dev_err(ice_pf_to_dev(vsi->back), "enable Tx/Rx filter promiscuous mode on VF-%u failed, error: %s\n",
+			vf->vf_id, ice_stat_str(status));
+		return ice_status_to_errno(status);
 	}
 
-	return status;
+	return 0;
+}
+
+static int
+ice_vf_clear_vsi_promisc(struct ice_vf *vf, struct ice_vsi *vsi, u8 promisc_m)
+{
+	struct ice_hw *hw = &vsi->back->hw;
+	enum ice_status status;
+
+	if (vf->port_vlan_info)
+		status = ice_fltr_clear_vsi_promisc(hw, vsi->idx, promisc_m,
+						    vf->port_vlan_info & VLAN_VID_MASK);
+	else if (vsi->num_vlan > 1)
+		status = ice_fltr_clear_vlan_vsi_promisc(hw, vsi, promisc_m);
+	else
+		status = ice_fltr_clear_vsi_promisc(hw, vsi->idx, promisc_m, 0);
+
+	if (status && status != ICE_ERR_DOES_NOT_EXIST) {
+		dev_err(ice_pf_to_dev(vsi->back), "disable Tx/Rx filter promiscuous mode on VF-%u failed, error: %s\n",
+			vf->vf_id, ice_stat_str(status));
+		return ice_status_to_errno(status);
+	}
+
+	return 0;
 }
 
 static void ice_vf_clear_counters(struct ice_vf *vf)
@@ -1614,6 +1588,30 @@ static bool ice_is_vf_disabled(struct ice_vf *vf)
 }
 
 /**
+ * ice_reset_interrupts - clear all queue interrupt configuration for a VSI
+ * @vsi: the VSI whose interrupt registers should be cleared
+ *
+ * Zero the QINT_RQCTL and QINT_TQCTL registers for all allocated queues
+ * in the VSI. This clears the entire register including MSIX_INDX, ITR_INDX,
+ * CAUSE_ENA and NEXTQ fields, unlike ice_vf_dis_rxq_interrupt() which only
+ * clears the CAUSE_ENA bit.
+ */
+static void ice_reset_interrupts(struct ice_vsi *vsi)
+{
+	struct ice_pf *pf = vsi->back;
+	struct ice_hw *hw = &pf->hw;
+	int i;
+
+	ice_for_each_alloc_rxq(vsi, i)
+		wr32(hw, QINT_RQCTL(vsi->rxq_map[i]), 0);
+
+	ice_for_each_alloc_txq(vsi, i)
+		wr32(hw, QINT_TQCTL(vsi->txq_map[i]), 0);
+
+	ice_flush(hw);
+}
+
+/**
  * ice_reset_vf - Reset a particular VF
  * @vf: pointer to the VF structure
  * @is_vflr: true if VFLR was issued, false if not
@@ -1655,6 +1653,9 @@ bool ice_reset_vf(struct ice_vf *vf, bool is_vflr)
 	vsi = ice_get_vf_vsi(vf);
 
 	ice_dis_vf_qs(vf);
+
+	/* cleanup interrupt registers */
+	ice_reset_interrupts(vsi);
 
 	/* Call Disable LAN Tx queue AQ whether or not queues are
 	 * enabled. This is needed for successful completion of VFR.
@@ -1700,7 +1701,7 @@ bool ice_reset_vf(struct ice_vf *vf, bool is_vflr)
 		else
 			promisc_m = ICE_UCAST_PROMISC_BITS;
 
-		if (ice_vf_set_vsi_promisc(vf, vsi, promisc_m, true))
+		if (ice_vf_clear_vsi_promisc(vf, vsi, promisc_m))
 			dev_err(dev, "disabling promiscuous mode failed\n");
 	}
 
@@ -2952,10 +2953,10 @@ bool ice_is_any_vf_in_promisc(struct ice_pf *pf)
 static int ice_vc_cfg_promiscuous_mode_msg(struct ice_vf *vf, u8 *msg)
 {
 	enum virtchnl_status_code v_ret = VIRTCHNL_STATUS_SUCCESS;
-	enum ice_status mcast_status = 0, ucast_status = 0;
 	bool rm_promisc, alluni = false, allmulti = false;
 	struct virtchnl_promisc_info *info =
 	    (struct virtchnl_promisc_info *)msg;
+	int mcast_err = 0, ucast_err = 0;
 	struct ice_pf *pf = vf->pf;
 	struct ice_vsi *vsi;
 	struct device *dev;
@@ -3052,24 +3053,21 @@ static int ice_vc_cfg_promiscuous_mode_msg(struct ice_vf *vf, u8 *msg)
 			ucast_m = ICE_UCAST_PROMISC_BITS;
 		}
 
-		ucast_status = ice_vf_set_vsi_promisc(vf, vsi, ucast_m,
-						      !alluni);
-		if (ucast_status) {
-			dev_err(dev, "%sable Tx/Rx filter promiscuous mode on VF-%d failed\n",
-				alluni ? "en" : "dis", vf->vf_id);
-			v_ret = ice_err_to_virt_err(ucast_status);
-		}
+		if (alluni)
+			ucast_err = ice_vf_set_vsi_promisc(vf, vsi, ucast_m);
+		else
+			ucast_err = ice_vf_clear_vsi_promisc(vf, vsi, ucast_m);
 
-		mcast_status = ice_vf_set_vsi_promisc(vf, vsi, mcast_m,
-						      !allmulti);
-		if (mcast_status) {
-			dev_err(dev, "%sable Tx/Rx filter promiscuous mode on VF-%d failed\n",
-				allmulti ? "en" : "dis", vf->vf_id);
-			v_ret = ice_err_to_virt_err(mcast_status);
-		}
+		if (allmulti)
+			mcast_err = ice_vf_set_vsi_promisc(vf, vsi, mcast_m);
+		else
+			mcast_err = ice_vf_clear_vsi_promisc(vf, vsi, mcast_m);
+
+		if (ucast_err || mcast_err)
+			v_ret = VIRTCHNL_STATUS_ERR_PARAM;
 	}
 
-	if (!mcast_status) {
+	if (!mcast_err) {
 		if (allmulti &&
 		    !test_and_set_bit(ICE_VF_STATE_MC_PROMISC, vf->vf_states))
 			dev_info(dev, "VF %u successfully set multicast promiscuous mode\n",
@@ -3079,7 +3077,7 @@ static int ice_vc_cfg_promiscuous_mode_msg(struct ice_vf *vf, u8 *msg)
 				 vf->vf_id);
 	}
 
-	if (!ucast_status) {
+	if (!ucast_err) {
 		if (alluni && !test_and_set_bit(ICE_VF_STATE_UC_PROMISC, vf->vf_states))
 			dev_info(dev, "VF %u successfully set unicast promiscuous mode\n",
 				 vf->vf_id);
@@ -3194,6 +3192,24 @@ static void ice_vf_ena_rxq_interrupt(struct ice_vsi *vsi, u32 q_idx)
 		return;
 
 	wr32(hw, QINT_RQCTL(pfq), reg | QINT_RQCTL_CAUSE_ENA_M);
+}
+
+/**
+ * ice_vf_dis_rxq_interrupt - disable Rx queue interrupt via QINT_RQCTL
+ * @vsi: VSI of the VF to configure
+ * @q_idx: VF queue index used to determine the queue in the PF's space
+ */
+static void ice_vf_dis_rxq_interrupt(struct ice_vsi *vsi, u32 q_idx)
+{
+	struct ice_hw *hw = &vsi->back->hw;
+	u32 pfq = vsi->rxq_map[q_idx];
+	u32 reg;
+
+	reg = rd32(hw, QINT_RQCTL(pfq));
+	reg &= ~QINT_RQCTL_CAUSE_ENA_M;
+	wr32(hw, QINT_RQCTL(pfq), reg);
+
+	ice_flush(hw);
 }
 
 /**
@@ -3365,6 +3381,8 @@ static int ice_vc_dis_qs_msg(struct ice_vf *vf, u8 *msg)
 			goto error_param;
 		}
 
+		for_each_set_bit(vf_q_id, &q_map, ICE_MAX_RSS_QS_PER_VF)
+			ice_vf_dis_rxq_interrupt(vsi, vf_q_id);
 		bitmap_zero(vf->rxq_ena, ICE_MAX_RSS_QS_PER_VF);
 	} else if (q_map) {
 		for_each_set_bit(vf_q_id, &q_map, ICE_MAX_RSS_QS_PER_VF) {
@@ -3385,6 +3403,7 @@ static int ice_vc_dis_qs_msg(struct ice_vf *vf, u8 *msg)
 				goto error_param;
 			}
 
+			ice_vf_dis_rxq_interrupt(vsi, vf_q_id);
 			/* Clear enabled queues flag */
 			clear_bit(vf_q_id, vf->rxq_ena);
 		}
@@ -3614,7 +3633,7 @@ static int ice_vc_cfg_qs_msg(struct ice_vf *vf, u8 *msg)
 
 			if (qpi->rxq.databuffer_size != 0 &&
 			    (qpi->rxq.databuffer_size > ((16 * 1024) - 128) ||
-			     qpi->rxq.databuffer_size < 1024)) {
+			     qpi->rxq.databuffer_size < 128)) {
 				v_ret = VIRTCHNL_STATUS_ERR_PARAM;
 				goto error_param;
 			}

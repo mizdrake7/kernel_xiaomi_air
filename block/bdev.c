@@ -29,6 +29,9 @@
 #include "../fs/internal.h"
 #include "blk.h"
 
+#undef CREATE_TRACE_POINTS
+#include <trace/hooks/vmscan.h>
+
 struct bdev_inode {
 	struct block_device bdev;
 	struct inode vfs_inode;
@@ -374,6 +377,7 @@ int bdev_write_page(struct block_device *bdev, sector_t sector,
 		end_page_writeback(page);
 	} else {
 		clean_page_buffers(page);
+		trace_android_vh_shrink_page_lock_owner_clear(page);
 		unlock_page(page);
 	}
 	blk_queue_exit(bdev->bd_disk->queue);
@@ -459,16 +463,12 @@ EXPORT_SYMBOL_GPL(blockdev_superblock);
 
 void __init bdev_cache_init(void)
 {
-	int err;
 	static struct vfsmount *bd_mnt;
 
 	bdev_cachep = kmem_cache_create("bdev_cache", sizeof(struct bdev_inode),
 			0, (SLAB_HWCACHE_ALIGN|SLAB_RECLAIM_ACCOUNT|
 				SLAB_MEM_SPREAD|SLAB_ACCOUNT|SLAB_PANIC),
 			init_once);
-	err = register_filesystem(&bd_type);
-	if (err)
-		panic("Cannot register bdev pseudo-fs");
 	bd_mnt = kern_mount(&bd_type);
 	if (IS_ERR(bd_mnt))
 		panic("Cannot create bdev pseudo-fs");
@@ -741,7 +741,7 @@ struct block_device *blkdev_get_no_open(dev_t dev)
 		inode = ilookup(blockdev_superblock, dev);
 		if (inode)
 			pr_warn_ratelimited(
-"block device autoloading is deprecated. It will be removed in Linux 5.19\n");
+"block device autoloading is deprecated and will be removed.\n");
 	}
 	if (!inode)
 		return NULL;
@@ -991,6 +991,18 @@ int lookup_bdev(const char *pathname, dev_t *dev)
 	if (!may_open_dev(&path))
 		goto out_path_put;
 
+	/*
+	 * Reject a block device inode with i_rdev == 0.  A dev_t of 0 is
+	 * never valid for a block device: no real block device driver
+	 * registers major 0.  Fake block device inodes (e.g. fuse with
+	 * rootmode=S_IFBLK) can expose i_rdev == 0, and letting that
+	 * propagate would confuse superblock lookup and trigger warnings
+	 * in the device-to-superblock table (super_dev_register).
+	 */
+	error = -ENODEV;
+	if (!inode->i_rdev)
+		goto out_path_put;
+
 	*dev = inode->i_rdev;
 	error = 0;
 out_path_put:
@@ -1050,6 +1062,15 @@ void sync_bdevs(bool wait)
 		old_inode = inode;
 		bdev = I_BDEV(inode);
 
+		/*
+		 * The inode does not keep the gendisk of a partition alive, the
+		 * device does.
+		 */
+		if (!kobject_get_unless_zero(&bdev->bd_device.kobj)) {
+			spin_lock(&blockdev_superblock->s_inode_list_lock);
+			continue;
+		}
+
 		mutex_lock(&bdev->bd_disk->open_mutex);
 		if (!bdev->bd_openers) {
 			; /* skip */
@@ -1065,6 +1086,7 @@ void sync_bdevs(bool wait)
 			filemap_fdatawrite(inode->i_mapping);
 		}
 		mutex_unlock(&bdev->bd_disk->open_mutex);
+		put_device(&bdev->bd_device);
 
 		spin_lock(&blockdev_superblock->s_inode_list_lock);
 	}

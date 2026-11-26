@@ -500,6 +500,8 @@ static void coredump_finish(struct mm_struct *mm, bool core_dumped)
 	spin_unlock_irq(&current->sighand->siglock);
 
 	next = mm->core_state->dumper.next;
+	/* A released thread may exit and be freed before it is woken. */
+	rcu_read_lock();
 	while ((curr = next) != NULL) {
 		next = curr->next;
 		task = curr->task;
@@ -508,9 +510,11 @@ static void coredump_finish(struct mm_struct *mm, bool core_dumped)
 		 * ->task == NULL before we read ->next.
 		 */
 		smp_mb();
+		/* Any wakeup now lets the thread exit, rcu keeps it alive. */
 		curr->task = NULL;
 		wake_up_process(task);
 	}
+	rcu_read_unlock();
 
 	mm->core_state = NULL;
 }
@@ -576,7 +580,9 @@ static int umh_pipe_setup(struct subprocess_info *info, struct cred *new)
 {
 	struct file *files[2];
 	struct coredump_params *cp = (struct coredump_params *)info->data;
-	int err = create_pipe_files(files, 0);
+	int err;
+
+	err = create_pipe_files(files, 0);
 	if (err)
 		return err;
 
@@ -584,10 +590,13 @@ static int umh_pipe_setup(struct subprocess_info *info, struct cred *new)
 
 	err = replace_fd(0, files[0], 0);
 	fput(files[0]);
+	if (err < 0)
+		return err;
+
 	/* and disallow core files too */
 	current->signal->rlim[RLIMIT_CORE] = (struct rlimit){1, 1};
 
-	return err;
+	return 0;
 }
 
 #if IS_ENABLED(CONFIG_MTK_AVOID_TRUNCATE_COREDUMP)

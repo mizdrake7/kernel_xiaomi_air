@@ -23,6 +23,7 @@
 #include <linux/slab.h>
 #include <linux/percpu-refcount.h>
 #include <linux/bpfptr.h>
+#include <linux/rcupdate_trace.h>
 #include <linux/android_kabi.h>
 
 struct bpf_verifier_env;
@@ -1382,6 +1383,9 @@ out:
 		_ret;					\
 	})
 
+#define bpf_rcu_lock_held() \
+	(rcu_read_lock_held() || rcu_read_lock_trace_held() || rcu_read_lock_bh_held())
+
 #ifdef CONFIG_BPF_SYSCALL
 DECLARE_PER_CPU(int, bpf_prog_active);
 extern struct mutex bpf_stats_enabled_mutex;
@@ -1703,6 +1707,29 @@ bool bpf_prog_test_check_kfunc_call(u32 kfunc_id);
 bool btf_ctx_access(int off, int size, enum bpf_access_type type,
 		    const struct bpf_prog *prog,
 		    struct bpf_insn_access_aux *info);
+
+static inline bool bpf_tracing_ctx_access(int off, int size,
+					  enum bpf_access_type type)
+{
+	if (off < 0 || off >= sizeof(__u64) * MAX_BPF_FUNC_ARGS)
+		return false;
+	if (type != BPF_READ)
+		return false;
+	if (off % size != 0)
+		return false;
+	return true;
+}
+
+static inline bool bpf_tracing_btf_ctx_access(int off, int size,
+					      enum bpf_access_type type,
+					      const struct bpf_prog *prog,
+					      struct bpf_insn_access_aux *info)
+{
+	if (!bpf_tracing_ctx_access(off, size, type))
+		return false;
+	return btf_ctx_access(off, size, type, prog, info);
+}
+
 int btf_struct_access(struct bpf_verifier_log *log, const struct btf *btf,
 		      const struct btf_type *t, int off, int size,
 		      enum bpf_access_type atype,

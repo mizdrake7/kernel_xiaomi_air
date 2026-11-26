@@ -259,7 +259,7 @@ void amdgpu_gmc_sysvm_location(struct amdgpu_device *adev, struct amdgpu_gmc *mc
  * @adev: amdgpu device structure holding all necessary information
  * @mc: memory controller structure holding memory information
  *
- * Function will place try to place GART before or after VRAM.
+ * Function will try to place GART before or after VRAM.
  * If GART size is bigger than space left then we ajust GART size.
  * Thus function will never fails.
  */
@@ -697,6 +697,13 @@ void amdgpu_gmc_get_vbios_allocations(struct amdgpu_device *adev)
 		adev->mman.keep_stolen_vga_memory = false;
 		break;
 	}
+	/* MacBookPros with switchable graphics put VRAM at 0 when
+	 * the iGPU is enabled which results in cursor issues if
+	 * the cursor ends up at 0.  Reserve vram at 0 in that case.
+	 */
+	if ((adev->pdev->subsystem_vendor == PCI_VENDOR_ID_APPLE) &&
+	    (adev->gmc.vram_start == 0))
+		adev->mman.keep_stolen_vga_memory = true;
 
 	if (amdgpu_sriov_vf(adev) ||
 	    !amdgpu_device_ip_get_ip_block(adev, AMD_IP_BLOCK_TYPE_DCE)) {

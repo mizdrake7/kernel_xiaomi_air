@@ -338,8 +338,6 @@ struct cache {
 	struct list_head invalidation_requests;
 
 	sector_t migration_threshold;
-	wait_queue_head_t migration_wait;
-	atomic_t nr_allocated_migrations;
 
 	/*
 	 * The number of in flight migrations that are performing
@@ -395,7 +393,11 @@ struct cache {
 	bool loaded_mappings:1;
 	bool loaded_discards:1;
 
-	struct rw_semaphore background_work_lock;
+	/* background work management */
+	bool background_work_allowed;
+	unsigned background_work_nr;
+	spinlock_t background_work_lock;
+	wait_queue_head_t background_work_wait;
 
 	struct batcher committer;
 	struct work_struct commit_ws;
@@ -405,6 +407,12 @@ struct cache {
 	mempool_t migration_pool;
 
 	struct bio_set bs;
+
+	/*
+	 * Cache_size entries. Set bits indicate blocks mapped beyond the
+	 * target length, which are marked for invalidation.
+	 */
+	unsigned long *invalid_bitset;
 };
 
 struct per_bio_data {
@@ -480,19 +488,13 @@ static struct dm_cache_migration *alloc_migration(struct cache *cache)
 	memset(mg, 0, sizeof(*mg));
 
 	mg->cache = cache;
-	atomic_inc(&cache->nr_allocated_migrations);
 
 	return mg;
 }
 
 static void free_migration(struct dm_cache_migration *mg)
 {
-	struct cache *cache = mg->cache;
-
-	if (atomic_dec_and_test(&cache->nr_allocated_migrations))
-		wake_up(&cache->migration_wait);
-
-	mempool_free(mg, &cache->migration_pool);
+	mempool_free(mg, &mg->cache->migration_pool);
 }
 
 /*----------------------------------------------------------------*/
@@ -1020,34 +1022,39 @@ static void calc_discard_block_range(struct cache *cache, struct bio *bio,
 
 static void prevent_background_work(struct cache *cache)
 {
-	lockdep_off();
-	down_write(&cache->background_work_lock);
-	lockdep_on();
+	spin_lock_irq(&cache->background_work_lock);
+	cache->background_work_allowed = false;
+	wait_event_lock_irq(cache->background_work_wait,
+			    cache->background_work_nr == 0,
+			    cache->background_work_lock);
+	spin_unlock_irq(&cache->background_work_lock);
 }
 
 static void allow_background_work(struct cache *cache)
 {
-	lockdep_off();
-	up_write(&cache->background_work_lock);
-	lockdep_on();
+	spin_lock_irq(&cache->background_work_lock);
+	cache->background_work_allowed = true;
+	spin_unlock_irq(&cache->background_work_lock);
 }
 
 static bool background_work_begin(struct cache *cache)
 {
 	bool r;
 
-	lockdep_off();
-	r = down_read_trylock(&cache->background_work_lock);
-	lockdep_on();
-
+	spin_lock_irq(&cache->background_work_lock);
+	r = cache->background_work_allowed;
+	if (r)
+		cache->background_work_nr++;
+	spin_unlock_irq(&cache->background_work_lock);
 	return r;
 }
 
 static void background_work_end(struct cache *cache)
 {
-	lockdep_off();
-	up_read(&cache->background_work_lock);
-	lockdep_on();
+	spin_lock_irq(&cache->background_work_lock);
+	if (--cache->background_work_nr == 0)
+		wake_up(&cache->background_work_wait);
+	spin_unlock_irq(&cache->background_work_lock);
 }
 
 /*----------------------------------------------------------------*/
@@ -1447,9 +1454,14 @@ static void invalidate_complete(struct dm_cache_migration *mg, bool success)
 	struct bio_list bios;
 	struct cache *cache = mg->cache;
 
+	if (success)
+		atomic_inc(&cache->stats.demotion);
+
 	bio_list_init(&bios);
-	if (dm_cell_unlock_v2(cache->prison, mg->cell, &bios))
-		free_prison_cell(cache, mg->cell);
+	if (mg->cell) {
+		if (dm_cell_unlock_v2(cache->prison, mg->cell, &bios))
+			free_prison_cell(cache, mg->cell);
+	}
 
 	if (!success && mg->overwrite_bio)
 		bio_io_error(mg->overwrite_bio);
@@ -1522,6 +1534,15 @@ static int invalidate_lock(struct dm_cache_migration *mg)
 			    READ_WRITE_LOCK_LEVEL, prealloc, &mg->cell);
 	if (r < 0) {
 		free_prison_cell(cache, prealloc);
+
+		/* Defer the bio for retrying the cell lock */
+		if (mg->overwrite_bio) {
+			struct bio *bio = mg->overwrite_bio;
+
+			mg->overwrite_bio = NULL;
+			defer_bio(cache, bio);
+		}
+
 		invalidate_complete(mg, false);
 		return r;
 	}
@@ -1680,8 +1701,8 @@ static int map_bio(struct cache *cache, struct bio *bio, dm_oblock_t block,
 		if (passthrough_mode(cache)) {
 			if (bio_data_dir(bio) == WRITE) {
 				bio_drop_shared_lock(cache, bio);
-				atomic_inc(&cache->stats.demotion);
 				invalidate_start(cache, cblock, block, bio);
+				return DM_MAPIO_SUBMITTED;
 			} else
 				remap_to_origin_clear_discard(cache, bio, block);
 		} else {
@@ -1890,16 +1911,13 @@ static void check_migrations(struct work_struct *ws)
  * This function gets called on the error paths of the constructor, so we
  * have to cope with a partially initialised struct.
  */
-static void destroy(struct cache *cache)
+static void __destroy(struct cache *cache)
 {
-	unsigned i;
-
 	mempool_exit(&cache->migration_pool);
 
 	if (cache->prison)
 		dm_bio_prison_destroy_v2(cache->prison);
 
-	cancel_delayed_work_sync(&cache->waker);
 	if (cache->wq)
 		destroy_workqueue(cache->wq);
 
@@ -1908,6 +1926,9 @@ static void destroy(struct cache *cache)
 
 	if (cache->discard_bitset)
 		free_bitset(cache->discard_bitset);
+
+	if (cache->invalid_bitset)
+		free_bitset(cache->invalid_bitset);
 
 	if (cache->copier)
 		dm_kcopyd_client_destroy(cache->copier);
@@ -1927,13 +1948,22 @@ static void destroy(struct cache *cache)
 	if (cache->policy)
 		dm_cache_policy_destroy(cache->policy);
 
+	bioset_exit(&cache->bs);
+
+	kfree(cache);
+}
+
+static void destroy(struct cache *cache)
+{
+	unsigned int i;
+
+	cancel_delayed_work_sync(&cache->waker);
+
 	for (i = 0; i < cache->nr_ctr_args ; i++)
 		kfree(cache->ctr_args[i]);
 	kfree(cache->ctr_args);
 
-	bioset_exit(&cache->bs);
-
-	kfree(cache);
+	__destroy(cache);
 }
 
 static void cache_dtr(struct dm_target *ti)
@@ -2443,29 +2473,12 @@ static int cache_create(struct cache_args *ca, struct cache **result)
 		goto bad;
 	}
 
-	if (passthrough_mode(cache)) {
-		bool all_clean;
-
-		r = dm_cache_metadata_all_clean(cache->cmd, &all_clean);
-		if (r) {
-			*error = "dm_cache_metadata_all_clean() failed";
-			goto bad;
-		}
-
-		if (!all_clean) {
-			*error = "Cannot enter passthrough mode unless all blocks are clean";
-			r = -EINVAL;
-			goto bad;
-		}
-
+	if (passthrough_mode(cache))
 		policy_allow_migrations(cache->policy, false);
-	}
 
 	spin_lock_init(&cache->lock);
 	bio_list_init(&cache->deferred_bios);
-	atomic_set(&cache->nr_allocated_migrations, 0);
 	atomic_set(&cache->nr_io_migrations, 0);
-	init_waitqueue_head(&cache->migration_wait);
 
 	r = -ENOMEM;
 	atomic_set(&cache->nr_dirty, 0);
@@ -2487,6 +2500,13 @@ static int cache_create(struct cache_args *ca, struct cache **result)
 		goto bad;
 	}
 	clear_bitset(cache->discard_bitset, from_dblock(cache->discard_nr_blocks));
+
+	cache->invalid_bitset = alloc_bitset(from_cblock(cache->cache_size));
+	if (!cache->invalid_bitset) {
+		*error = "could not allocate bitset for invalid blocks";
+		goto bad;
+	}
+	clear_bitset(cache->invalid_bitset, from_cblock(cache->cache_size));
 
 	cache->copier = dm_kcopyd_client_create(&dm_kcopyd_throttle);
 	if (IS_ERR(cache->copier)) {
@@ -2540,13 +2560,15 @@ static int cache_create(struct cache_args *ca, struct cache **result)
 		     issue_op, cache, cache->wq);
 	dm_iot_init(&cache->tracker);
 
-	init_rwsem(&cache->background_work_lock);
-	prevent_background_work(cache);
+	init_waitqueue_head(&cache->background_work_wait);
+	spin_lock_init(&cache->background_work_lock);
+	cache->background_work_allowed = false;
+	cache->background_work_nr = 0;
 
 	*result = cache;
 	return 0;
 bad:
-	destroy(cache);
+	__destroy(cache);
 	return r;
 }
 
@@ -2597,7 +2619,7 @@ static int cache_ctr(struct dm_target *ti, unsigned argc, char **argv)
 
 	r = copy_ctr_args(cache, argc - 3, (const char **)argv + 3);
 	if (r) {
-		destroy(cache);
+		__destroy(cache);
 		goto out;
 	}
 
@@ -2778,12 +2800,36 @@ static int load_mapping(void *context, dm_oblock_t oblock, dm_cblock_t cblock,
 	struct cache *cache = context;
 
 	if (dirty) {
+		if (passthrough_mode(cache)) {
+			DMERR("%s: cannot enter passthrough mode unless all blocks are clean",
+			      cache_device_name(cache));
+			return -EBUSY;
+		}
+
 		set_bit(from_cblock(cblock), cache->dirty_bitset);
 		atomic_inc(&cache->nr_dirty);
 	} else
 		clear_bit(from_cblock(cblock), cache->dirty_bitset);
 
 	return policy_load_mapping(cache->policy, oblock, cblock, dirty, hint, hint_valid);
+}
+
+static int load_filtered_mapping(void *context, dm_oblock_t oblock, dm_cblock_t cblock,
+				 bool dirty, uint32_t hint, bool hint_valid)
+{
+	struct cache *cache = context;
+
+	if (from_oblock(oblock) >= from_oblock(cache->origin_blocks)) {
+		if (dirty) {
+			DMERR("%s: unable to shrink origin; cache block %u is dirty",
+			      cache_device_name(cache), from_cblock(cblock));
+			return -EFBIG;
+		}
+		set_bit(from_cblock(cblock), cache->invalid_bitset);
+		return 0;
+	}
+
+	return load_mapping(context, oblock, cblock, dirty, hint, hint_valid);
 }
 
 /*
@@ -2877,6 +2923,27 @@ static dm_cblock_t get_cache_dev_size(struct cache *cache)
 	return to_cblock(size);
 }
 
+static bool can_resume(struct cache *cache)
+{
+	/*
+	 * Disallow retrying the resume operation for devices that failed the
+	 * first resume attempt, as the failure leaves the policy object partially
+	 * initialized. Retrying could trigger BUG_ON when loading cache mappings
+	 * into the incomplete policy object.
+	 */
+	if (cache->sized && !cache->loaded_mappings) {
+		if (get_cache_mode(cache) != CM_WRITE)
+			DMERR("%s: unable to resume a failed-loaded cache, please check metadata.",
+			      cache_device_name(cache));
+		else
+			DMERR("%s: unable to resume cache due to missing proper cache table reload",
+			      cache_device_name(cache));
+		return false;
+	}
+
+	return true;
+}
+
 static bool can_resize(struct cache *cache, dm_cblock_t new_size)
 {
 	if (from_cblock(new_size) > from_cblock(cache->cache_size)) {
@@ -2919,11 +2986,32 @@ static int resize_cache_dev(struct cache *cache, dm_cblock_t new_size)
 	return 0;
 }
 
+static int truncate_oblocks(struct cache *cache)
+{
+	uint32_t nr_blocks = from_cblock(cache->cache_size);
+	uint32_t i;
+	int r;
+
+	for_each_set_bit(i, cache->invalid_bitset, nr_blocks) {
+		r = dm_cache_remove_mapping(cache->cmd, to_cblock(i));
+		if (r) {
+			DMERR_LIMIT("%s: invalidation failed; couldn't update on disk metadata",
+				    cache_device_name(cache));
+			return r;
+		}
+	}
+
+	return 0;
+}
+
 static int cache_preresume(struct dm_target *ti)
 {
 	int r = 0;
 	struct cache *cache = ti->private;
 	dm_cblock_t csize = get_cache_dev_size(cache);
+
+	if (!can_resume(cache))
+		return -EINVAL;
 
 	/*
 	 * Check to see if the cache has resized.
@@ -2940,11 +3028,25 @@ static int cache_preresume(struct dm_target *ti)
 	}
 
 	if (!cache->loaded_mappings) {
+		/*
+		 * The fast device could have been resized since the last
+		 * failed preresume attempt.  To be safe we start by a blank
+		 * bitset for cache blocks.
+		 */
+		clear_bitset(cache->invalid_bitset, from_cblock(cache->cache_size));
+
 		r = dm_cache_load_mappings(cache->cmd, cache->policy,
-					   load_mapping, cache);
+					   load_filtered_mapping, cache);
 		if (r) {
 			DMERR("%s: could not load cache mappings", cache_device_name(cache));
-			metadata_operation_failed(cache, "dm_cache_load_mappings", r);
+			if (r != -EFBIG && r != -EBUSY)
+				metadata_operation_failed(cache, "dm_cache_load_mappings", r);
+			return r;
+		}
+
+		r = truncate_oblocks(cache);
+		if (r) {
+			metadata_operation_failed(cache, "dm_cache_remove_mapping", r);
 			return r;
 		}
 
@@ -3418,7 +3520,7 @@ static void cache_io_hints(struct dm_target *ti, struct queue_limits *limits)
 
 static struct target_type cache_target = {
 	.name = "cache",
-	.version = {2, 2, 0},
+	.version = {2, 3, 0},
 	.module = THIS_MODULE,
 	.ctr = cache_ctr,
 	.dtr = cache_dtr,

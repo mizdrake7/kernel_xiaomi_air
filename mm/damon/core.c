@@ -634,7 +634,7 @@ static void damon_do_apply_schemes(struct damon_ctx *c,
 			quota->charged_sz += sz;
 			if (quota->esz && quota->charged_sz >= quota->esz) {
 				quota->charge_target_from = t;
-				quota->charge_addr_from = r->ar.end + 1;
+				quota->charge_addr_from = r->ar.end;
 			}
 		}
 		if (s->action != DAMOS_STAT)
@@ -661,8 +661,8 @@ static void damos_set_effective_quota(struct damos_quota *quota)
 	}
 
 	if (quota->total_charged_ns)
-		throughput = quota->total_charged_sz * 1000000 /
-			quota->total_charged_ns;
+		throughput = mult_frac(quota->total_charged_sz, 1000000,
+						quota->total_charged_ns);
 	else
 		throughput = PAGE_SIZE * 1024;
 	esz = throughput * quota->ms;
@@ -689,8 +689,15 @@ static void kdamond_apply_schemes(struct damon_ctx *c)
 		if (!quota->ms && !quota->sz)
 			continue;
 
+		/* First charge window */
+		if (!quota->total_charged_sz && !quota->charged_from) {
+			quota->charged_from = jiffies;
+			damos_set_effective_quota(quota);
+		}
+
 		/* New charge window starts */
-		if (time_after_eq(jiffies, quota->charged_from +
+		if (!time_in_range_open(jiffies, quota->charged_from,
+					quota->charged_from +
 					msecs_to_jiffies(
 						quota->reset_interval))) {
 			if (quota->esz && quota->charged_sz >= quota->esz)
@@ -807,15 +814,20 @@ static void kdamond_merge_regions(struct damon_ctx *c, unsigned int threshold,
 
 	max_thres = c->aggr_interval /
 		(c->sample_interval ?  c->sample_interval : 1);
-	do {
+	while (true) {
 		nr_regions = 0;
 		damon_for_each_target(t, c) {
 			damon_merge_regions_of(t, threshold, sz_limit);
 			nr_regions += damon_nr_regions(t);
 		}
-		threshold = max(1, threshold * 2);
-	} while (nr_regions > c->max_nr_regions &&
-			threshold / 2 < max_thres);
+		if (nr_regions <= c->max_nr_regions ||
+				max_thres <= threshold)
+			break;
+		if (threshold < max_thres / 2)
+			threshold = max(1, threshold * 2);
+		else
+			threshold = max_thres;
+	}
 }
 
 /*
@@ -885,7 +897,6 @@ static void kdamond_split_regions(struct damon_ctx *ctx)
 {
 	struct damon_target *t;
 	unsigned int nr_regions = 0;
-	static unsigned int last_nr_regions;
 	int nr_subregions = 2;
 
 	damon_for_each_target(t, ctx)
@@ -895,14 +906,14 @@ static void kdamond_split_regions(struct damon_ctx *ctx)
 		return;
 
 	/* Maybe the middle of the region has different access frequency */
-	if (last_nr_regions == nr_regions &&
+	if (ctx->last_nr_regions == nr_regions &&
 			nr_regions < ctx->max_nr_regions / 3)
 		nr_subregions = 3;
 
 	damon_for_each_target(t, ctx)
 		damon_split_regions_of(ctx, t, nr_subregions);
 
-	last_nr_regions = nr_regions;
+	ctx->last_nr_regions = nr_regions;
 }
 
 /*

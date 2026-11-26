@@ -210,7 +210,11 @@ int __anon_vma_prepare(struct vm_area_struct *vma)
 	/* page_table_lock to protect against threads */
 	spin_lock(&mm->page_table_lock);
 	if (likely(!vma->anon_vma)) {
-		vma->anon_vma = anon_vma;
+		/*
+		 * Make anon_vma fields visible before anon_vma is published.
+		 * Paired with an address dependency in reusable_anon_vma().
+		 */
+		smp_store_release(&vma->anon_vma, anon_vma);
 		anon_vma_chain_link(vma, avc, anon_vma);
 		anon_vma->num_active_vmas++;
 		allocated = NULL;
@@ -812,15 +816,27 @@ static bool page_referenced_one(struct page *page, struct vm_area_struct *vma,
 		}
 
 		if (pvmw.pte) {
-			trace_android_vh_look_around(&pvmw, page, vma, &referenced);
-			if (lru_gen_enabled() && pte_young(*pvmw.pte) &&
-			    !(vma->vm_flags & (VM_SEQ_READ | VM_RAND_READ))) {
-				lru_gen_look_around(&pvmw);
-				referenced++;
-			}
+			pte_t pteval = ptep_get(pvmw.pte);
+			bool young = false;
 
-			if (ptep_clear_flush_young_notify(vma, address,
-						pvmw.pte)) {
+			/*
+			 * PFN swap PTEs, such as device-exclusive ones, that
+			 * actually map pages are "old" from a CPU perspective.
+			 * The MMU notifier takes care of any device aspects.
+			 */
+			if (pte_present(pteval)) {
+				trace_android_vh_look_around(&pvmw, page, vma, &referenced);
+				if (lru_gen_enabled() && pte_young(*pvmw.pte) &&
+				    !(vma->vm_flags & (VM_SEQ_READ | VM_RAND_READ))) {
+					lru_gen_look_around(&pvmw);
+					referenced++;
+				}
+
+				young = ptep_clear_flush_young(vma, address, pvmw.pte);
+			}
+			young |= mmu_notifier_clear_flush_young(vma->vm_mm, address,
+								address + PAGE_SIZE);
+			if (young) {
 				/*
 				 * Don't treat a reference through
 				 * a sequentially read mapping as such.
@@ -1236,6 +1252,7 @@ void page_add_new_anon_rmap(struct page *page,
 	}
 	__mod_lruvec_page_state(page, NR_ANON_MAPPED, nr);
 	__page_set_anon_rmap(page, vma, address, 1);
+	trace_android_vh_page_add_new_anon_rmap(page, vma, address);
 }
 
 /**
@@ -2272,7 +2289,7 @@ static bool page_make_device_exclusive(struct page *page, struct mm_struct *mm,
 	 * issues. Also tail pages shouldn't be passed to rmap_walk so skip
 	 * those.
 	 */
-	if (!PageAnon(page) || PageTail(page))
+	if (!PageAnon(page) || PageTail(page) || PageHuge(page))
 		return false;
 
 	rmap_walk(page, &rwc);

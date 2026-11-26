@@ -248,19 +248,19 @@ vlan_for_each(struct net_device *dev,
 
 static inline struct net_device *vlan_dev_real_dev(const struct net_device *dev)
 {
-	BUG();
+	WARN_ON_ONCE(1);
 	return NULL;
 }
 
 static inline u16 vlan_dev_vlan_id(const struct net_device *dev)
 {
-	BUG();
+	WARN_ON_ONCE(1);
 	return 0;
 }
 
 static inline __be16 vlan_dev_vlan_proto(const struct net_device *dev)
 {
-	BUG();
+	WARN_ON_ONCE(1);
 	return 0;
 }
 
@@ -345,6 +345,9 @@ static inline int __vlan_insert_inner_tag(struct sk_buff *skb,
 					  unsigned int mac_len)
 {
 	struct vlan_ethhdr *veth;
+
+	if (unlikely(!pskb_may_pull(skb, mac_len)))
+		return -EINVAL;
 
 	if (skb_cow_head(skb, VLAN_HLEN) < 0)
 		return -ENOMEM;

@@ -129,6 +129,16 @@ config ANDROID_FIX_PCIE_SLAVE_ERROR
 	  When pcie encounters completion timeout, PCIe hardware will reply
 	  slave error to bus, which will causes the system to panic.
 
+config ANDROID_WRAPFD
+	bool "WrapFD Driver"
+	depends on MMU
+	help
+	  Enable WrapFD driver to control ability to map a file
+
+	  WrapFD allows wrapping an fd representing a memory buffer into a new
+	  file supporting ioctl API for file ownership that controls ability to
+	  map the file.
+
 endif # if ANDROID
 
 endmenu

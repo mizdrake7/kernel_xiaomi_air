@@ -298,6 +298,7 @@ static int amd_i2c_dw_xfer_quirk(struct i2c_adapter *adap, struct i2c_msg *msgs,
 
 	dev->msgs = msgs;
 	dev->msgs_num = num_msgs;
+	dev->msg_write_idx = 0;
 	i2c_dw_xfer_init(dev);
 	i2c_dw_disable_int(dev);
 
@@ -438,6 +439,14 @@ i2c_dw_xfer_msg(struct dw_i2c_dev *dev)
 
 				/* Avoid rx buffer overrun */
 				if (dev->rx_outstanding >= dev->rx_fifo_depth)
+					break;
+
+				/*
+				 * For block reads, queue only the length
+				 * byte until i2c_dw_recv_len() runs.
+				 */
+				if ((flags & I2C_M_RECV_LEN) &&
+				    buf_len < msgs[dev->msg_write_idx].len)
 					break;
 
 				regmap_write(dev->map, DW_IC_DATA_CMD,
