@@ -92,8 +92,12 @@
 #define DEFAULT_BLC_BOOST 0
 #define DEFAULT_HEAVY_TASK_NUM 0
 
+#ifndef MAX
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
+#endif
+#ifndef MIN
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
+#endif
 
 #define SEQ_printf(m, x...)\
 do {\
