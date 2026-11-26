@@ -9,13 +9,28 @@ export LOCALVERSION="-AirStorm-Nethunter-OSS"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [ -f "$SCRIPT_DIR/../build/build.sh" ] && [ -d "$SCRIPT_DIR/../vendor/mediatek/kernel_modules" ]; then
+if [ -f "$SCRIPT_DIR/../build/build.sh" ] && [ -d "$SCRIPT_DIR/../vendor/mediatek/kernel_modules" ] && [ -d "$SCRIPT_DIR/../kernel-5.15" ]; then
     ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-    KERNEL_DIR="$SCRIPT_DIR"
-else
-    ROOT_DIR="$SCRIPT_DIR/workspace"
     KERNEL_DIR="$ROOT_DIR/kernel-5.15"
-    if [ ! -f "$ROOT_DIR/build/build.sh" ] || [ ! -d "$ROOT_DIR/vendor/mediatek/kernel_modules" ]; then
+else
+    EXISTING_REPO_ROOT=""
+    CHECK_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+    while [ "$CHECK_DIR" != "/" ]; do
+        if [ -d "$CHECK_DIR/.repo" ]; then
+            EXISTING_REPO_ROOT="$CHECK_DIR"
+            break
+        fi
+        CHECK_DIR="$(dirname "$CHECK_DIR")"
+    done
+
+    if [ -n "$EXISTING_REPO_ROOT" ]; then
+        ROOT_DIR="$EXISTING_REPO_ROOT"
+    else
+        ROOT_DIR="$SCRIPT_DIR/workspace"
+    fi
+    KERNEL_DIR="$ROOT_DIR/kernel-5.15"
+
+    if [ ! -f "$ROOT_DIR/build/build.sh" ] || [ ! -d "$ROOT_DIR/vendor/mediatek/kernel_modules" ] || [ ! -d "$KERNEL_DIR" ]; then
         if ! command -v repo >/dev/null 2>&1; then
             echo "ERROR: 'repo' tool not found in PATH!"
             exit 1
@@ -24,8 +39,8 @@ else
         mkdir -p "$ROOT_DIR"
         (
             cd "$ROOT_DIR"
-            repo init -u https://github.com/mizdrake7/local_manifest -b kernel_airstorm
-            repo sync -c --force-sync --no-clone-bundle --no-tags -j4
+            repo init -u https://github.com/mizdrake7/local_manifest -b kernel_airstorm </dev/null
+            repo sync -c --force-sync --no-clone-bundle --no-tags -j4 </dev/null
         )
     fi
 fi
@@ -58,25 +73,28 @@ if [ ! -e "$KERNEL_DIR/drivers/kernelsu/Makefile" ]; then
     ln -sfn ../KernelSU-Next/kernel "$KERNEL_DIR/drivers/kernelsu"
 fi
 
-if [ ! -x "$TC_DIR/bin/clang" ] && [ ! -x "$TC_DIR/bin/clang-14" ]; then
-    echo "Downloading ZyC Clang 14..."
+if [ ! -x "$TC_DIR/bin/clang" ] || ! "$TC_DIR/bin/clang" --version 2>/dev/null | grep -q "clang version 23\."; then
+    echo "Downloading ZyC Clang 23..."
+    rm -rf "$TC_DIR"
     mkdir -p "$TC_DIR"
-    wget -O /tmp/zyc_clang.tar.gz \
-    https://github.com/ZyCromerZ/Clang/releases/download/14.0.6-20250704-release/Clang-14.0.6-20250704.tar.gz
-    tar -xzf /tmp/zyc_clang.tar.gz -C "$TC_DIR"
-    rm -f /tmp/zyc_clang.tar.gz
-    if [ ! -x "$TC_DIR/bin/clang" ] && [ ! -x "$TC_DIR/bin/clang-14" ]; then
+    wget -O "$TC_DIR/zyc_clang.tar.gz" \
+    https://github.com/ZyCromerZ/Clang/releases/download/23.0.0git-20260130-release/Clang-23.0.0git-20260130.tar.gz
+    tar -xzf "$TC_DIR/zyc_clang.tar.gz" -C "$TC_DIR"
+    rm -f "$TC_DIR/zyc_clang.tar.gz"
+    if [ ! -x "$TC_DIR/bin/clang" ]; then
         echo "ERROR: Clang not found after extraction!"
         exit 1
     fi
 fi
 
+cat <<'EOF' > "$TC_DIR/build.config.zyc"
+CLANG_PREBUILT_BIN=tc/zyc_clang/bin
+HERMETIC_TOOLCHAIN=0
+KCFLAGS="${KCFLAGS} -Wno-int-conversion -Wno-strict-prototypes -Wno-enum-compare -Wno-sometimes-uninitialized"
+EOF
+
 export PATH="$TC_DIR/bin:$PATH"
-if [ -x "$TC_DIR/bin/clang-14" ]; then
-    export CC="$TC_DIR/bin/clang-14"
-else
-    export CC="$TC_DIR/bin/clang"
-fi
+export CC="$TC_DIR/bin/clang"
 export LD="$TC_DIR/bin/ld.lld"
 export AR="$TC_DIR/bin/llvm-ar"
 export NM="$TC_DIR/bin/llvm-nm"
@@ -99,6 +117,7 @@ BUILD_START=$(date +%s)
 
 echo "Building Kernel ..."
 BUILD_CONFIG=kernel-5.15/build.config.mtk.aarch64.mgk \
+BUILD_CONFIG_FRAGMENTS=tc/zyc_clang/build.config.zyc \
 OUT_DIR="$ROOT_DIR/out/android13-5.15" \
 build/build.sh 2>&1 | tee "$ROOT_DIR/build.log"
 
