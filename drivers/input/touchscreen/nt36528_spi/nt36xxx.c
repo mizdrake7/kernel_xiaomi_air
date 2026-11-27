@@ -3386,7 +3386,6 @@ static int nvt_mtk_drm_notifier_callback(struct notifier_block *nb,
 		unsigned long event, void *data)
 {
     int *blank = (int *)data;
-    uint32_t i = 0;
 
     if (!blank) {
         NVT_ERR("Invalid blank\n");
@@ -3397,27 +3396,12 @@ static int nvt_mtk_drm_notifier_callback(struct notifier_block *nb,
         if (*blank == MTK_DISP_BLANK_POWERDOWN) {
 			NVT_LOG("event=%lu, *blank=%d\n", event, *blank);
 			NVT_LOG("proximity_event = %d\n", proximity_event);
-			if(!proximity_event){
-				nvt_ts_suspend(&ts->client->dev);
-			} else {
-				mutex_lock(&ts->lock);
-				nvt_set_proximity_power_saving_switch(1);
-				mutex_unlock(&ts->lock);
-				bTouchIsAwake = 0;
-#if MT_PROTOCOL_B
-				for (i = 0; i < ts->max_touch_num; i++) {
-					input_mt_slot(ts->input_dev, i);
-					input_report_abs(ts->input_dev, ABS_MT_TOUCH_MAJOR, 0);
-					input_report_abs(ts->input_dev, ABS_MT_PRESSURE, 0);
-					input_mt_report_slot_state(ts->input_dev, MT_TOOL_FINGER, 0);
-				}
-#endif
-				input_report_key(ts->input_dev, BTN_TOUCH, 0);
-#if !MT_PROTOCOL_B
-				input_mt_sync(ts->input_dev);
-#endif
-				input_sync(ts->input_dev);
-			}
+			/*
+			 * Keyguard disables virtual proximity right before blanking, while
+			 * nvt_set_proximity_switch(0) sleeps before clearing proximity_event.
+			 * Always suspend so gesture wake mode is armed on display off.
+			 */
+			nvt_ts_suspend(&ts->client->dev);
         }
 	} else if (event == MTK_DISP_EVENT_BLANK) {
 		if (*blank == MTK_DISP_BLANK_UNBLANK) {
