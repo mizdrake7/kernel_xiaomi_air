@@ -223,9 +223,9 @@ restart:
 			pmde = *pvmw->pmd;
 			if (likely(pmd_trans_huge(pmde))) {
 				if (pvmw->flags & PVMW_MIGRATION)
-					goto next_pmd;
+					return not_found(pvmw);
 				if (pmd_page(pmde) != page)
-					goto next_pmd;
+					return not_found(pvmw);
 				return true;
 			}
 			if (!pmd_present(pmde)) {
@@ -233,11 +233,11 @@ restart:
 
 				if (!thp_migration_supported() ||
 				    !(pvmw->flags & PVMW_MIGRATION))
-					goto next_pmd;
+					return not_found(pvmw);
 				entry = pmd_to_swp_entry(pmde);
 				if (!is_migration_entry(entry) ||
 				    pfn_swap_entry_to_page(entry) != page)
-					goto next_pmd;
+					return not_found(pvmw);
 				return true;
 			}
 			/* THP pmd was split under us: handle on pte level */
@@ -255,7 +255,8 @@ restart:
 
 				spin_unlock(ptl);
 			}
-			goto next_pmd;
+			step_forward(pvmw, PMD_SIZE);
+			continue;
 		}
 		if (!map_pte(pvmw))
 			goto next_pte;
@@ -289,17 +290,6 @@ next_pte:
 			spin_lock(pvmw->ptl);
 		}
 		goto this_pte;
-next_pmd:
-		/*
-		 * A large folio can be PTE-mapped across PMDs, so a
-		 * nonmatching PMD does not end the walk.
-		 */
-		if (pvmw->ptl) {
-			spin_unlock(pvmw->ptl);
-			pvmw->ptl = NULL;
-		}
-		pvmw->pmd = NULL;
-		step_forward(pvmw, PMD_SIZE);
 	} while (pvmw->address < end);
 
 	return false;
