@@ -781,7 +781,7 @@ static bool acpi_of_modalias(struct acpi_device *adev,
 
 	str = obj->string.pointer;
 	chr = strchr(str, ',');
-	strlcpy(modalias, chr ? chr + 1 : str, len);
+	strscpy(modalias, chr ? chr + 1 : str, len);
 
 	return true;
 }
@@ -801,7 +801,7 @@ void acpi_set_modalias(struct acpi_device *adev, const char *default_id,
 		       char *modalias, size_t len)
 {
 	if (!acpi_of_modalias(adev, modalias, len))
-		strlcpy(modalias, default_id, len);
+		strscpy(modalias, default_id, len);
 }
 EXPORT_SYMBOL_GPL(acpi_set_modalias);
 
@@ -1335,8 +1335,10 @@ static int __init acpi_init(void)
 	}
 
 	acpi_kobj = kobject_create_and_add("acpi", firmware_kobj);
-	if (!acpi_kobj)
-		pr_debug("%s: kset create error\n", __func__);
+	if (!acpi_kobj) {
+		pr_err("Failed to register kobject\n");
+		return -ENOMEM;
+	}
 
 	init_prmt();
 	result = acpi_bus_init();

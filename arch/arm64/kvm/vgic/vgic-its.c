@@ -704,6 +704,8 @@ struct vgic_its *vgic_msi_to_its(struct kvm *kvm, struct kvm_msi *msi)
 	u64 address;
 	struct kvm_io_device *kvm_io_dev;
 	struct vgic_io_device *iodev;
+	struct vgic_its *its = NULL;
+	int srcu_idx;
 
 	if (!vgic_has_its(kvm))
 		return ERR_PTR(-ENODEV);
@@ -713,18 +715,23 @@ struct vgic_its *vgic_msi_to_its(struct kvm *kvm, struct kvm_msi *msi)
 
 	address = (u64)msi->address_hi << 32 | msi->address_lo;
 
+	srcu_idx = srcu_read_lock(&kvm->srcu);
+
 	kvm_io_dev = kvm_io_bus_get_dev(kvm, KVM_MMIO_BUS, address);
 	if (!kvm_io_dev)
-		return ERR_PTR(-EINVAL);
+		goto out;
 
 	if (kvm_io_dev->ops != &kvm_io_gic_ops)
-		return ERR_PTR(-EINVAL);
+		goto out;
 
 	iodev = container_of(kvm_io_dev, struct vgic_io_device, dev);
 	if (iodev->iodev_type != IODEV_ITS)
-		return ERR_PTR(-EINVAL);
+		goto out;
 
-	return iodev->its;
+	its = iodev->its;
+out:
+	srcu_read_unlock(&kvm->srcu, srcu_idx);
+	return its ?: ERR_PTR(-EINVAL);
 }
 
 /*
@@ -814,12 +821,19 @@ int vgic_its_inject_msi(struct kvm *kvm, struct kvm_msi *msi)
 /* Requires the its_lock to be held. */
 static void its_free_ite(struct kvm *kvm, struct its_ite *ite)
 {
+	unsigned long flags;
+
 	list_del(&ite->ite_list);
 
 	/* This put matches the get in vgic_add_lpi. */
 	if (ite->irq) {
+		raw_spin_lock_irqsave(&ite->irq->irq_lock, flags);
 		if (ite->irq->hw)
 			WARN_ON(its_unmap_vlpi(ite->irq->host_irq));
+
+		ite->irq->hw = false;
+		ite->irq->mapped = false;
+		raw_spin_unlock_irqrestore(&ite->irq->irq_lock, flags);
 
 		vgic_put_irq(kvm, ite->irq);
 	}
@@ -1067,6 +1081,7 @@ static int vgic_its_cmd_handle_mapi(struct kvm *kvm, struct vgic_its *its,
 	struct its_device *device;
 	struct its_collection *collection, *new_coll = NULL;
 	struct vgic_irq *irq;
+	unsigned long flags;
 	int lpi_nr;
 
 	device = find_its_device(its, device_id);
@@ -1107,13 +1122,27 @@ static int vgic_its_cmd_handle_mapi(struct kvm *kvm, struct vgic_its *its,
 		vcpu = kvm_get_vcpu(kvm, collection->target_addr);
 
 	irq = vgic_add_lpi(kvm, lpi_nr, vcpu);
+	if (!IS_ERR(irq)) {
+		/* Mapping one LPI from two events is UNPREDICTABLE: the first ITE keeps it. */
+		raw_spin_lock_irqsave(&irq->irq_lock, flags);
+		if (!irq->mapped) {
+			irq->mapped = true;
+			irq->target_vcpu = vcpu;
+			ite->irq = irq;
+		}
+		raw_spin_unlock_irqrestore(&irq->irq_lock, flags);
+
+		if (!ite->irq) {
+			vgic_put_irq(kvm, irq);
+			irq = ERR_PTR(-EEXIST);
+		}
+	}
 	if (IS_ERR(irq)) {
 		if (new_coll)
 			vgic_its_free_collection(its, coll_id);
 		its_free_ite(kvm, ite);
 		return PTR_ERR(irq);
 	}
-	ite->irq = irq;
 
 	return 0;
 }
@@ -2144,6 +2173,14 @@ static int vgic_its_save_ite(struct vgic_its *its, struct its_device *dev,
 	u32 next_offset;
 	u64 val;
 
+	/*
+	 * MAPC with V=0 keeps the ITEs mapped but drops their collection,
+	 * and with it the ICID. Save a zeroed entry, which the restore path
+	 * reads back as invalid.
+	 */
+	if (!ite->collection)
+		return vgic_its_write_entry_lock(its, gpa, 0ULL, ite_esz);
+
 	next_offset = compute_next_eventid_offset(&dev->itt_head, ite);
 	val = ((u64)next_offset << KVM_ITS_ITE_NEXT_SHIFT) |
 	       ((u64)ite->irq->intid << KVM_ITS_ITE_PINTID_SHIFT) |
@@ -2171,6 +2208,7 @@ static int vgic_its_restore_ite(struct vgic_its *its, u32 event_id,
 	struct vgic_irq *irq;
 	u32 coll_id, lpi_id;
 	struct its_ite *ite;
+	unsigned long flags;
 	u32 offset;
 
 	val = *p;
@@ -2204,7 +2242,20 @@ static int vgic_its_restore_ite(struct vgic_its *its, u32 event_id,
 	irq = vgic_add_lpi(kvm, lpi_id, vcpu);
 	if (IS_ERR(irq))
 		return PTR_ERR(irq);
-	ite->irq = irq;
+
+	raw_spin_lock_irqsave(&irq->irq_lock, flags);
+	if (!irq->mapped) {
+		irq->mapped = true;
+		irq->target_vcpu = vcpu;
+		ite->irq = irq;
+	}
+	raw_spin_unlock_irqrestore(&irq->irq_lock, flags);
+
+	/* Drop an ITE whose LPI another ITE maps, as MAPTI does. */
+	if (!ite->irq) {
+		vgic_put_irq(kvm, irq);
+		its_free_ite(kvm, ite);
+	}
 
 	return offset;
 }

@@ -241,23 +241,6 @@ void __delete_from_page_cache(struct page *page, void *shadow)
 	page_cache_delete(mapping, page, shadow);
 }
 
-static void page_cache_free_page(struct address_space *mapping,
-				struct page *page)
-{
-	void (*freepage)(struct page *);
-
-	freepage = mapping->a_ops->freepage;
-	if (freepage)
-		freepage(page);
-
-	if (PageTransHuge(page) && !PageHuge(page)) {
-		page_ref_sub(page, thp_nr_pages(page));
-		VM_BUG_ON_PAGE(page_count(page) <= 0, page);
-	} else {
-		put_page(page);
-	}
-}
-
 /**
  * delete_from_page_cache - delete page from page cache
  * @page: the page which the kernel is trying to remove from page cache
@@ -269,13 +252,22 @@ static void page_cache_free_page(struct address_space *mapping,
 void delete_from_page_cache(struct page *page)
 {
 	struct address_space *mapping = page_mapping(page);
+	void (*freepage)(struct page *page);
 
 	BUG_ON(!PageLocked(page));
 	xa_lock_irq(&mapping->i_pages);
 	__delete_from_page_cache(page, NULL);
+	freepage = mapping->a_ops->freepage;
 	xa_unlock_irq(&mapping->i_pages);
 
-	page_cache_free_page(mapping, page);
+	if (freepage)
+		freepage(page);
+	if (PageTransHuge(page) && !PageHuge(page)) {
+		page_ref_sub(page, thp_nr_pages(page));
+		VM_BUG_ON_PAGE(page_count(page) <= 0, page);
+	} else {
+		put_page(page);
+	}
 }
 EXPORT_SYMBOL(delete_from_page_cache);
 
@@ -344,6 +336,7 @@ static void page_cache_delete_batch(struct address_space *mapping,
 void delete_from_page_cache_batch(struct address_space *mapping,
 				  struct pagevec *pvec)
 {
+	void (*freepage)(struct page *page);
 	int i;
 
 	if (!pagevec_count(pvec))
@@ -356,10 +349,21 @@ void delete_from_page_cache_batch(struct address_space *mapping,
 		unaccount_page_cache_page(mapping, pvec->pages[i]);
 	}
 	page_cache_delete_batch(mapping, pvec);
+	freepage = mapping->a_ops->freepage;
 	xa_unlock_irq(&mapping->i_pages);
 
-	for (i = 0; i < pagevec_count(pvec); i++)
-		page_cache_free_page(mapping, pvec->pages[i]);
+	for (i = 0; i < pagevec_count(pvec); i++) {
+		struct page *page = pvec->pages[i];
+
+		if (freepage)
+			freepage(page);
+		if (PageTransHuge(page) && !PageHuge(page)) {
+			page_ref_sub(page, thp_nr_pages(page));
+			VM_BUG_ON_PAGE(page_count(page) <= 0, page);
+		} else {
+			put_page(page);
+		}
+	}
 }
 
 int filemap_check_errors(struct address_space *mapping)
@@ -1416,10 +1420,22 @@ repeat:
 	 * return value based on that state without races.
 	 *
 	 * Also note that WQ_FLAG_WOKEN is sufficient for a non-exclusive
-	 * waiter, but an exclusive one requires WQ_FLAG_DONE.
+	 * waiter, but an exclusive one must also acquire the bit.
 	 */
-	if (behavior == EXCLUSIVE)
-		return wait->flags & WQ_FLAG_DONE ? 0 : -EINTR;
+	if (behavior == EXCLUSIVE) {
+		if (wait->flags & WQ_FLAG_DONE)
+			return 0;
+		/*
+		 * We might have just been woken up and the waker will not
+		 * wake up anybody else. If we ignore that now, the remaining
+		 * waiters may not get woken up: take the bit now if it is
+		 * still free.
+		 */
+		if ((wait->flags & WQ_FLAG_WOKEN) &&
+		    !test_and_set_bit(bit_nr, &page->flags))
+			return 0;
+		return -EINTR;
+	}
 
 	return wait->flags & WQ_FLAG_WOKEN ? 0 : -EINTR;
 }
@@ -2446,6 +2462,8 @@ static int filemap_update_page(struct kiocb *iocb,
 {
 	int error;
 
+	trace_android_vh_filemap_update_page(mapping, page, iocb->ki_filp);
+
 	if (iocb->ki_flags & IOCB_NOWAIT) {
 		if (!filemap_invalidate_trylock_shared(mapping))
 			return -EAGAIN;
@@ -2639,7 +2657,7 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 	if (unlikely(!iov_iter_count(iter)))
 		return 0;
 
-	iov_iter_truncate(iter, inode->i_sb->s_maxbytes);
+	iov_iter_truncate(iter, inode->i_sb->s_maxbytes - iocb->ki_pos);
 	pagevec_init(&pvec);
 	trace_android_vh_filemap_read(filp, iocb->ki_pos, iov_iter_count(iter));
 
@@ -2930,14 +2948,17 @@ unlock:
  * @page - the page to lock.
  * @fpin - the pointer to the file we may pin (or is already pinned).
  *
- * This works similar to lock_page_or_retry in that it can drop the mmap_lock.
- * It differs in that it actually returns the page locked if it returns 1 and 0
- * if it couldn't lock the page.  If we did have to drop the mmap_lock then fpin
- * will point to the pinned file and needs to be fput()'ed at a later point.
+ * Returns 1 with the page locked, or 0 if locking failed.
+ *
+ * On both entry and return, a non-NULL *fpin means the fault lock has
+ * already been dropped and the caller must eventually fput() the file.
+ * Otherwise the fault lock is still held, including on failure.
  */
 static int lock_page_maybe_drop_mmap(struct vm_fault *vmf, struct page *page,
 				     struct file **fpin)
 {
+	struct task_struct *tsk = NULL;
+
 	if (trylock_page(page))
 		return 1;
 
@@ -2950,20 +2971,16 @@ static int lock_page_maybe_drop_mmap(struct vm_fault *vmf, struct page *page,
 		return 0;
 
 	*fpin = maybe_unlock_mmap_for_io(vmf, *fpin);
+	trace_android_vh_lock_folio_drop_mmap_start(&tsk, vmf, page, *fpin);
 	if (vmf->flags & FAULT_FLAG_KILLABLE) {
 		if (__lock_page_killable(page)) {
-			/*
-			 * We didn't have the right flags to drop the mmap_lock,
-			 * but all fault_handlers only check for fatal signals
-			 * if we return VM_FAULT_RETRY, so we need to drop the
-			 * mmap_lock here and return 0 if we don't have a fpin.
-			 */
-			if (*fpin == NULL)
-				mmap_read_unlock(vmf->vma->vm_mm);
+			trace_android_vh_lock_folio_drop_mmap_end(false, &tsk, vmf, page, *fpin);
 			return 0;
 		}
 	} else
 		__lock_page(page);
+
+	trace_android_vh_lock_folio_drop_mmap_end(true, &tsk, vmf, page, *fpin);
 	return 1;
 }
 
@@ -3018,6 +3035,7 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
 	trace_android_vh_tune_mmap_readaround(ra->ra_pages, vmf->pgoff,
 			&ra->start, &ra->size, &ra->async_size);
 	ractl._index = ra->start;
+	trace_android_vh_page_cache_read(file->f_inode, ra->start, ra->size);
 	do_page_cache_ra(&ractl, ra->size, ra->async_size);
 	return fpin;
 }
@@ -3036,6 +3054,11 @@ static struct file *do_async_mmap_readahead(struct vm_fault *vmf,
 	struct file *fpin = NULL;
 	unsigned int mmap_miss;
 	pgoff_t offset = vmf->pgoff;
+	bool skip = false;
+
+	trace_android_vh_do_async_mmap_readahead(vmf, page, &skip);
+	if (skip)
+		return fpin;
 
 	/* If we don't want any read-ahead, don't bother */
 	if (vmf->vma->vm_flags & VM_RAND_READ || !ra->ra_pages)
@@ -3067,7 +3090,7 @@ static struct file *do_async_mmap_readahead(struct vm_fault *vmf,
  * Otherwise, vma->vm_mm->mmap_lock must be held on entry.
  *
  * If our return value has VM_FAULT_RETRY set, it's because the mmap_lock
- * may be dropped before doing I/O or by lock_page_maybe_drop_mmap().
+ * may be dropped before doing I/O or when aborting an interrupted wait.
  *
  * If our return value does not have VM_FAULT_RETRY set, the mmap_lock
  * has not been released.
@@ -3182,6 +3205,8 @@ retry_find:
 		}
 	}
 
+	trace_android_vh_filemap_fault_pre_page_locked(page);
+
 	if (!lock_page_maybe_drop_mmap(vmf, page, &fpin))
 		goto out_retry;
 
@@ -3246,6 +3271,7 @@ page_not_uptodate:
 	 * and we need to check for errors.
 	 */
 	fpin = maybe_unlock_mmap_for_io(vmf, fpin);
+	trace_android_vh_page_cache_read(file->f_inode, offset, 1);
 	error = filemap_read_page(file, mapping, page);
 	if (fpin)
 		goto out_retry;
@@ -3259,9 +3285,8 @@ page_not_uptodate:
 
 out_retry:
 	/*
-	 * We dropped the mmap_lock, we need to return to the fault handler to
-	 * re-find the vma and come back and find our hopefully still populated
-	 * page.
+	 * With fpin set, the fault lock was already dropped. Otherwise it is
+	 * still held. Release invalidate_lock before dropping either protection.
 	 */
 	if (page)
 		put_page(page);
@@ -3269,6 +3294,8 @@ out_retry:
 		filemap_invalidate_unlock_shared(mapping);
 	if (fpin)
 		fput(fpin);
+	else if (!(vmf->flags & FAULT_FLAG_RETRY_NOWAIT))
+		mmap_read_unlock(vmf->vma->vm_mm);
 	return ret | VM_FAULT_RETRY;
 }
 EXPORT_SYMBOL(filemap_fault);
@@ -3386,12 +3413,14 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 	vm_fault_t ret = (vmf->flags & FAULT_FLAG_SPECULATIVE) ?
 		VM_FAULT_RETRY : 0;
 	pgoff_t first_pgoff = 0;
+	pgoff_t orig_start_pgoff = start_pgoff;
 
 	/* filemap_map_pages() is called within an rcu read lock already. */
 	head = first_map_page(mapping, &xas, end_pgoff);
 	if (!head)
 		return ret;
 	first_pgoff = xas.xa_index;
+	orig_start_pgoff = xas.xa_index;
 
 	if (!(vmf->flags & FAULT_FLAG_SPECULATIVE) &&
 	    filemap_map_pmd(vmf, head))
@@ -3432,12 +3461,14 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 		continue;
 unlock:
 		unlock_page(head);
+		trace_android_vh_filemap_page_mapped(head);
 		put_page(head);
 	} while ((head = next_map_page(mapping, &xas, end_pgoff)) != NULL);
 	pte_unmap_unlock(vmf->pte, vmf->ptl);
 	vmf->pte = NULL;
 	WRITE_ONCE(file->f_ra.mmap_miss, mmap_miss);
 	trace_android_vh_filemap_map_pages(file, first_pgoff, last_pgoff, ret);
+	trace_android_vh_filemap_map_pages_range(file, orig_start_pgoff, last_pgoff, ret);
 	return ret;
 }
 EXPORT_SYMBOL(filemap_map_pages);
@@ -3493,7 +3524,7 @@ int generic_file_mmap(struct file *file, struct vm_area_struct *vma)
  */
 int generic_file_readonly_mmap(struct file *file, struct vm_area_struct *vma)
 {
-	if ((vma->vm_flags & VM_SHARED) && (vma->vm_flags & VM_MAYWRITE))
+	if (vma_is_shared_maywrite(vma))
 		return -EINVAL;
 	return generic_file_mmap(file, vma);
 }
@@ -3536,6 +3567,8 @@ static struct page *do_read_cache_page(struct address_space *mapping,
 {
 	struct page *page;
 	int err;
+
+	trace_android_vh_page_cache_read(mapping->host, index, 1);
 repeat:
 	page = find_get_page(mapping, index);
 	if (!page) {

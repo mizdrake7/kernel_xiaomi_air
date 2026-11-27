@@ -85,10 +85,6 @@ static struct vfsmount *shm_mnt;
 
 #include "internal.h"
 
-#ifdef CONFIG_MEMFD_ASHMEM_SHIM
-#include "memfd-ashmem-shim.h"
-#endif
-
 #define BLOCKS_PER_PAGE  (PAGE_SIZE/512)
 #define VM_ACCT(size)    (PAGE_ALIGN(size) >> PAGE_SHIFT)
 
@@ -254,6 +250,11 @@ static const struct inode_operations shmem_dir_inode_operations;
 static const struct inode_operations shmem_special_inode_operations;
 static const struct vm_operations_struct shmem_vm_ops;
 static struct file_system_type shmem_fs_type;
+
+bool shmem_file(struct file *file)
+{
+	return file && file_inode(file)->i_fop == &shmem_file_operations;
+}
 
 bool vma_is_shmem(struct vm_area_struct *vma)
 {
@@ -967,7 +968,7 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, loff_t lend,
 		}
 		pagevec_remove_exceptionals(&pvec);
 		pagevec_release(&pvec);
-		cond_resched();
+		cond_resched_tasks_rcu_qs();
 		index++;
 	}
 
@@ -1001,7 +1002,7 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, loff_t lend,
 
 	index = start;
 	while (index < end) {
-		cond_resched();
+		cond_resched_tasks_rcu_qs();
 
 		if (!find_get_entries(mapping, index, end - 1, &pvec,
 				indices)) {
@@ -1290,6 +1291,10 @@ static int shmem_unuse_inode(struct inode *inode, unsigned int type,
 			}
 		}
 
+		if (signal_pending(current)) {
+			ret = -ERESTARTSYS;
+			break;
+		}
 		start = indices[pvec.nr - 1];
 	} while (true);
 
@@ -2268,7 +2273,7 @@ static int shmem_mmap(struct file *file, struct vm_area_struct *vma)
 	struct shmem_inode_info *info = SHMEM_I(file_inode(file));
 	int ret;
 
-	ret = seal_check_future_write(info->seals, vma);
+	ret = seal_check_write(info->seals, vma);
 	if (ret)
 		return ret;
 
@@ -3861,12 +3866,6 @@ static const struct file_operations shmem_file_operations = {
 	.splice_read	= generic_file_splice_read,
 	.splice_write	= iter_file_splice_write,
 	.fallocate	= shmem_fallocate,
-#endif
-#ifdef CONFIG_MEMFD_ASHMEM_SHIM
-	.unlocked_ioctl	= memfd_ashmem_shim_ioctl,
-#ifdef CONFIG_COMPAT
-	.compat_ioctl	= memfd_ashmem_shim_compat_ioctl,
-#endif
 #endif
 };
 

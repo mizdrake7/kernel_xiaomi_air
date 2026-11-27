@@ -750,7 +750,7 @@ static int build_cipher_test_sglists(struct cipher_test_sglists *tsgls,
 	struct iov_iter input;
 	int err;
 
-	iov_iter_kvec(&input, WRITE, inputs, nr_inputs, src_total_len);
+	iov_iter_kvec(&input, ITER_SOURCE, inputs, nr_inputs, src_total_len);
 	err = build_test_sglist(&tsgls->src, cfg->src_divs, alignmask,
 				cfg->inplace ?
 					max(dst_total_len, src_total_len) :
@@ -1133,7 +1133,7 @@ static int build_hash_sglist(struct test_sglist *tsgl,
 
 	kv.iov_base = (void *)vec->plaintext;
 	kv.iov_len = vec->psize;
-	iov_iter_kvec(&input, WRITE, &kv, 1, vec->psize);
+	iov_iter_kvec(&input, ITER_SOURCE, &kv, 1, vec->psize);
 	return build_test_sglist(tsgl, cfg->src_divs, alignmask, vec->psize,
 				 &input, divs);
 }
@@ -4008,8 +4008,10 @@ static int test_akcipher_one(struct crypto_akcipher *tfm,
 			      crypto_akcipher_verify(req) :
 			      /* Run asymmetric encrypt */
 			      crypto_akcipher_encrypt(req), &wait);
-	if (err) {
-		pr_err("alg: akcipher: %s test failed. err %d\n", op, err);
+	if (err != vecs->verify_error) {
+		pr_err("alg: akcipher: %s test failed: expected %d, got %d\n",
+		       op, vecs->verify_error, err);
+		err = err ?: -EINVAL;
 		goto free_all;
 	}
 	if (!vecs->siggen_sigver_test && c) {
@@ -4031,9 +4033,9 @@ static int test_akcipher_one(struct crypto_akcipher *tfm,
 
 	/*
 	 * Don't invoke (decrypt or sign) test which require a private key
-	 * for vectors with only a public key.
+	 * for vectors with only a public key or an invalid signature.
 	 */
-	if (vecs->public_key_vec) {
+	if (vecs->public_key_vec || vecs->verify_error) {
 		err = 0;
 		goto free_all;
 	}

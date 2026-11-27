@@ -1456,6 +1456,8 @@ retry:
 		if (!trylock_page(page))
 			goto keep;
 
+		trace_android_vh_shrink_page_lock_owner_set(page);
+
 		VM_BUG_ON_PAGE(PageActive(page), page);
 
 		nr_pages = compound_nr(page);
@@ -1581,6 +1583,7 @@ retry:
 
 			/* Case 3 above */
 			} else {
+				trace_android_vh_shrink_page_lock_owner_clear(page);
 				unlock_page(page);
 				wait_on_page_writeback(page);
 				/* then go back and try same page again */
@@ -1610,6 +1613,7 @@ retry:
 		if (do_demote_pass &&
 		    (thp_migration_supported() || !PageTransHuge(page))) {
 			list_add(&page->lru, &demote_pages);
+			trace_android_vh_shrink_page_lock_owner_clear(page);
 			unlock_page(page);
 			continue;
 		}
@@ -1789,6 +1793,7 @@ retry:
 			if (!try_to_release_page(page, sc->gfp_mask))
 				goto activate_locked;
 			if (!mapping && page_count(page) == 1) {
+				trace_android_vh_shrink_page_lock_owner_clear(page);
 				unlock_page(page);
 				if (put_page_testzero(page))
 					goto free_it;
@@ -1825,6 +1830,7 @@ retry:
 							 sc->target_mem_cgroup))
 			goto keep_locked;
 
+		trace_android_vh_shrink_page_lock_owner_clear(page);
 		unlock_page(page);
 free_it:
 		/*
@@ -1881,6 +1887,7 @@ keep_locked:
 		 * usage here, which is to clear the try-lock bit.
 		 */
 		trace_android_vh_page_trylock_get_result(page, &page_trylock_result);
+		trace_android_vh_shrink_page_lock_owner_clear(page);
 		unlock_page(page);
 keep:
 		list_add(&page->lru, &ret_pages);
@@ -5795,7 +5802,7 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 			}
 		}
 
-		cond_resched();
+		cond_resched_tasks_rcu_qs();
 
 		if (nr_reclaimed < nr_to_reclaim || proportional_reclaim)
 			continue;
@@ -6412,6 +6419,7 @@ static bool throttle_direct_reclaim(gfp_t gfp_mask, struct zonelist *zonelist,
 	struct zoneref *z;
 	struct zone *zone;
 	pg_data_t *pgdat = NULL;
+	bool bypass = false;
 
 	/*
 	 * Kernel threads should not be throttled as they may be indirectly
@@ -6463,6 +6471,10 @@ static bool throttle_direct_reclaim(gfp_t gfp_mask, struct zonelist *zonelist,
 	if (task_is_critical())
 		goto out;
 
+	trace_android_vh_throttle_direct_reclaim_bypass(&bypass);
+	if (bypass)
+		goto out;
+
 	/* Account for the throttling */
 	count_vm_event(PGSCAN_DIRECT_THROTTLE);
 
@@ -6504,6 +6516,7 @@ unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
 		.may_unmap = 1,
 		.may_swap = 1,
 	};
+	int prio = 0;
 
 	/*
 	 * scan_control uses s8 fields for order, priority, and reclaim_idx.
@@ -6523,9 +6536,11 @@ unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
 
 	set_task_reclaim_state(current, &sc.reclaim_state);
 	trace_mm_vmscan_direct_reclaim_begin(order, sc.gfp_mask);
+	trace_android_vh_direct_reclaim_begin(&prio);
 
 	nr_reclaimed = do_try_to_free_pages(zonelist, &sc);
 
+	trace_android_vh_direct_reclaim_end(prio);
 	trace_mm_vmscan_direct_reclaim_end(nr_reclaimed);
 	set_task_reclaim_state(current, NULL);
 
@@ -7549,7 +7564,7 @@ int node_reclaim(struct pglist_data *pgdat, gfp_t gfp_mask, unsigned int order)
 		return NODE_RECLAIM_NOSCAN;
 
 	ret = __node_reclaim(pgdat, gfp_mask, order);
-	clear_bit(PGDAT_RECLAIM_LOCKED, &pgdat->flags);
+	clear_bit_unlock(PGDAT_RECLAIM_LOCKED, &pgdat->flags);
 
 	if (!ret)
 		count_vm_event(PGSCAN_ZONE_RECLAIM_FAILED);

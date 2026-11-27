@@ -84,6 +84,10 @@ DECLARE_RESTRICTED_HOOK(android_rvh_set_user_nice,
 	TP_PROTO(struct task_struct *p, long *nice, bool *allowed),
 	TP_ARGS(p, nice, allowed), 1);
 
+DECLARE_RESTRICTED_HOOK(android_rvh_set_user_nice_locked,
+	TP_PROTO(struct task_struct *p, long *nice),
+	TP_ARGS(p, nice), 1);
+
 DECLARE_RESTRICTED_HOOK(android_rvh_setscheduler,
 	TP_PROTO(struct task_struct *p),
 	TP_ARGS(p), 1);
@@ -443,6 +447,15 @@ DECLARE_HOOK(android_vh_mmput,
 DECLARE_HOOK(android_vh_reweight_entity,
 	TP_PROTO(struct sched_entity *se),
 	TP_ARGS(se));
+
+DECLARE_RESTRICTED_HOOK(android_rvh_before_pick_task_fair,
+	TP_PROTO(struct rq *rq, struct task_struct **p,
+		 struct task_struct *prev, struct rq_flags *rf),
+	TP_ARGS(rq, p, prev, rf), 1);
+
+DECLARE_RESTRICTED_HOOK(android_rvh_balance_fair,
+	TP_PROTO(struct rq *rq, struct task_struct *prev, struct rq_flags *rf),
+	TP_ARGS(rq, prev, rf), 1);
 
 struct cgroup_subsys_state;
 DECLARE_HOOK(android_vh_sched_move_task,

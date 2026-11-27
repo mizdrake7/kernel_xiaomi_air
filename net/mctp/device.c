@@ -35,14 +35,6 @@ struct mctp_dev *mctp_dev_get_rtnl(const struct net_device *dev)
 	return rtnl_dereference(dev->mctp_ptr);
 }
 
-static void mctp_dev_destroy(struct mctp_dev *mdev)
-{
-	struct net_device *dev = mdev->dev;
-
-	dev_put(dev);
-	kfree_rcu(mdev, rcu);
-}
-
 static int mctp_fill_addrinfo(struct sk_buff *skb, struct netlink_callback *cb,
 			      struct mctp_dev *mdev, mctp_eid_t eid)
 {
@@ -55,6 +47,7 @@ static int mctp_fill_addrinfo(struct sk_buff *skb, struct netlink_callback *cb,
 		return -EMSGSIZE;
 
 	hdr = nlmsg_data(nlh);
+	memset(hdr, 0, sizeof(*hdr));
 	hdr->ifa_family = AF_MCTP;
 	hdr->ifa_prefixlen = 0;
 	hdr->ifa_flags = 0;
@@ -99,12 +92,19 @@ static int mctp_dump_addrinfo(struct sk_buff *skb, struct netlink_callback *cb)
 	struct net_device *dev;
 	struct ifaddrmsg *hdr;
 	struct mctp_dev *mdev;
-	int ifindex;
-	int idx, rc;
+	int idx;
+	int ifindex = 0, rc;
 
-	hdr = nlmsg_data(cb->nlh);
-	// filter by ifindex if requested
-	ifindex = hdr->ifa_index;
+	/* Filter by ifindex if a header is provided */
+	if (cb->nlh->nlmsg_len >= nlmsg_msg_size(sizeof(*hdr))) {
+		hdr = nlmsg_data(cb->nlh);
+		ifindex = hdr->ifa_index;
+	} else {
+		if (cb->strict_check) {
+			NL_SET_ERR_MSG(cb->extack, "mctp: Invalid header for addr dump request");
+			return -EINVAL;
+		}
+	}
 
 	rcu_read_lock();
 	for (; mcb->h < NETDEV_HASHENTRIES; mcb->h++, mcb->idx = 0) {
@@ -255,6 +255,19 @@ static int mctp_rtm_deladdr(struct sk_buff *skb, struct nlmsghdr *nlh,
 	return 0;
 }
 
+void mctp_dev_hold(struct mctp_dev *mdev)
+{
+	refcount_inc(&mdev->refs);
+}
+
+void mctp_dev_put(struct mctp_dev *mdev)
+{
+	if (refcount_dec_and_test(&mdev->refs)) {
+		dev_put(mdev->dev);
+		kfree_rcu(mdev, rcu);
+	}
+}
+
 static struct mctp_dev *mctp_add_dev(struct net_device *dev)
 {
 	struct mctp_dev *mdev;
@@ -269,10 +282,12 @@ static struct mctp_dev *mctp_add_dev(struct net_device *dev)
 
 	mdev->net = mctp_default_net(dev_net(dev));
 
-	/* associate to net_device */
-	rcu_assign_pointer(dev->mctp_ptr, mdev);
+	refcount_set(&mdev->refs, 1);
 	dev_hold(dev);
 	mdev->dev = dev;
+
+	/* Associate to net_device, publish the mdev. */
+	rcu_assign_pointer(dev->mctp_ptr, mdev);
 
 	return mdev;
 }
@@ -345,7 +360,7 @@ static void mctp_unregister(struct net_device *dev)
 	mctp_neigh_remove_dev(mdev);
 	kfree(mdev->addrs);
 
-	mctp_dev_destroy(mdev);
+	mctp_dev_put(mdev);
 }
 
 static int mctp_register(struct net_device *dev)

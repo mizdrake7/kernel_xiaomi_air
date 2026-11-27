@@ -49,7 +49,7 @@ struct sk_buff *alloc_can_err_skb(struct net_device *dev,
  */
 struct can_skb_priv {
 	int ifindex;
-	int skbcnt;
+	u32 skbcnt;
 	unsigned int frame_len;
 	struct can_frame cf[];
 };
