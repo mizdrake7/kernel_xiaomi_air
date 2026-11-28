@@ -251,6 +251,7 @@ struct fts_ts_data {
     spinlock_t irq_lock;
     struct mutex report_mutex;
     struct mutex bus_lock;
+    struct mutex prox_lock;
     unsigned long intr_jiffies;
     int irq;
     int log_level;
@@ -281,6 +282,8 @@ struct fts_ts_data {
     bool palm_sensor_switch;
     bool earphone_mode;
     bool gesture_support;   /* gesture enable or disable, default: disable */
+    bool delay_gesture;
+    bool pending_gesture;
     u8 gesture_bmode;       /*gesture buffer mode*/
 
     u8 pen_etype;

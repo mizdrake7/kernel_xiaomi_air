@@ -78,14 +78,17 @@ struct fts_ts_data *fts_data;
 * Static function prototypes
 *****************************************************************************/
 static int fts_ts_suspend(struct device *dev);
+static int fts_ts_suspend_locked(struct device *dev);
 static int fts_ts_resume(struct device *dev);
 
 int lct_fts_tp_gesture_callback(bool flag)
 {
     struct fts_ts_data *ts_data = fts_data;
     if (ts_data->suspended) {
-        FTS_ERROR("The gesture mode will be %s the next time you wakes up.", flag?"enabled":"disabled");
-        return -1;
+        ts_data->delay_gesture = true;
+        ts_data->pending_gesture = flag;
+        FTS_INFO("The gesture mode will be %s the next time you wakes up.", flag?"enabled":"disabled");
+        return 0;
     }
     set_lct_tp_gesture_status(flag);
    if (flag) {
@@ -155,12 +158,22 @@ static int fts_enter_proximity_mode(int mode)
         buf_value = 0x01;
         set_prox_lcd_reset_gpio_keep_high1(true);
         tp_proximity_event = 1;
+        fts_proximity_data.mode = ENABLE;
+        if (fts_data->suspended && !fts_proximity_suspend_flag) {
+            FTS_INFO("[PROXIMITY] suspended, deferring proximity enable to resume");
+            return 0;
+        }
 	    tp_ps_data = PROX_FAR;
         rc = mtk_ipi_send(&scp_ipidev, IPI_OUT_TP_PS, 0, &tp_ps_data, 1, 0);
     } else {
         buf_value = 0x00;
         set_prox_lcd_reset_gpio_keep_high1(false);
         tp_proximity_event = 0;
+        fts_proximity_data.mode = DISABLE;
+        if (fts_data->suspended && !fts_proximity_suspend_flag) {
+            FTS_INFO("[PROXIMITY] already suspended, skipping register write");
+            return 0;
+        }
     }
 
     ret = fts_write_reg(buf_addr, buf_value);
@@ -169,7 +182,6 @@ static int fts_enter_proximity_mode(int mode)
         return ret;
     }
 
-    fts_proximity_data.mode = buf_value ? ENABLE : DISABLE;
     FTS_INFO("[PROXIMITY] proximity mode = %d", fts_proximity_data.mode);
 
     return 0 ;
@@ -188,18 +200,21 @@ int fts_proximity_recovery(struct fts_ts_data *ts_data)
 int fts_set_proximity_switch(int proximity_switch)
 {
     int ret = 0;
- //	FTS_DEBUG("set proximity switch: %d, touch_lcm_name=%s\n", proximity_switch, touch_lcm_name);
-//	if ((strcmp(touch_lcm_name, "dsi_panel_c3u_35_03_0b_dsc_vdo")) != 0) {
-  //      FTS_ERROR("No lcm, setting disabled!\n");
-//	    return -1;
-  //  }
 
+    mutex_lock(&fts_data->prox_lock);
     mutex_lock(&fts_data->input_dev->mutex);
     ret = fts_enter_proximity_mode(proximity_switch);
     if (ret < 0) {
         FTS_ERROR("fts set proximity swith is error!");
     }
     mutex_unlock(&fts_data->input_dev->mutex);
+
+    if (!proximity_switch && fts_data->suspended && fts_proximity_suspend_flag) {
+        fts_proximity_suspend_flag = false;
+        fts_data->suspended = false;
+        fts_ts_suspend_locked(fts_data->dev);
+    }
+    mutex_unlock(&fts_data->prox_lock);
     return ret;
 }
 EXPORT_SYMBOL_GPL(fts_set_proximity_switch);
@@ -1993,7 +2008,7 @@ static int fts_parse_dt(struct device *dev, struct fts_ts_platform_data *pdata)
     return 0;
 }
 
-static int fts_ts_suspend(struct device *dev)
+static int fts_ts_suspend_locked(struct device *dev)
 {
     int ret = 0;
     struct fts_ts_data *ts_data = fts_data;
@@ -2061,13 +2076,26 @@ static int fts_ts_suspend(struct device *dev)
     return 0;
 }
 
+static int fts_ts_suspend(struct device *dev)
+{
+    int ret;
+
+    mutex_lock(&fts_data->prox_lock);
+    ret = fts_ts_suspend_locked(dev);
+    mutex_unlock(&fts_data->prox_lock);
+
+    return ret;
+}
+
 static int fts_ts_resume(struct device *dev)
 {
     struct fts_ts_data *ts_data = fts_data;
 
     FTS_FUNC_ENTER();
+    mutex_lock(&ts_data->prox_lock);
     if (!ts_data->suspended) {
         FTS_DEBUG("Already in awake state");
+        mutex_unlock(&ts_data->prox_lock);
         return 0;
     }
 
@@ -2076,22 +2104,26 @@ static int fts_ts_resume(struct device *dev)
 
 #if FTS_PSENSOR_ENABLE
     if (tp_proximity_event) {
-        fts_set_proximity_switch(ENABLE);
+        fts_enter_proximity_mode(ENABLE);
     }
 
     if ((!fts_proximity_resume()) && (fts_proximity_suspend_flag == true)) {
-    if (ts_data->gesture_support) {
-        fts_gesture_resume(ts_data);
-    }
         fts_proximity_suspend_flag = false;
         ts_data->suspended = false;
+        if (ts_data->delay_gesture) {
+            ts_data->delay_gesture = false;
+            lct_fts_tp_gesture_callback(ts_data->pending_gesture);
+        }
+        mutex_unlock(&ts_data->prox_lock);
         return 0;
     }
+    fts_proximity_suspend_flag = false;
 #endif
 
 #if FTS_PSENSOR_EN
     if (fts_proximity_resume() == 0) {
         ts_data->suspended = false;
+        mutex_unlock(&ts_data->prox_lock);
         return 0;
     }
 #endif
@@ -2146,6 +2178,12 @@ static int fts_ts_resume(struct device *dev)
                 g_touchscreen_earphone_pulgin.event_callback();
 #endif
 
+    if (ts_data->delay_gesture) {
+        ts_data->delay_gesture = false;
+        lct_fts_tp_gesture_callback(ts_data->pending_gesture);
+    }
+
+    mutex_unlock(&ts_data->prox_lock);
     FTS_FUNC_EXIT();
     return 0;
 }
@@ -2287,6 +2325,7 @@ int fts_ts_probe_entry(struct fts_ts_data *ts_data)
     spin_lock_init(&ts_data->irq_lock);
     mutex_init(&ts_data->report_mutex);
     mutex_init(&ts_data->bus_lock);
+    mutex_init(&ts_data->prox_lock);
     init_waitqueue_head(&ts_data->ts_waitqueue);
 
     ret = fts_bus_init(ts_data);
@@ -2483,6 +2522,7 @@ int fts_ts_remove_entry(struct fts_ts_data *ts_data)
     kfree_safe(ts_data->touch_buf);
     kfree_safe(ts_data->bus_tx_buf);
     kfree_safe(ts_data->bus_rx_buf);
+    mutex_destroy(&ts_data->prox_lock);
     kfree_safe(ts_data->pdata);
 
     FTS_FUNC_EXIT();
