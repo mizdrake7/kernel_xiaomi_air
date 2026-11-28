@@ -201,6 +201,9 @@ struct nvt_ts_data {
 	int32_t reset_gpio;
 	uint32_t reset_flags;
 	struct mutex lock;
+	struct mutex prox_lock;
+	bool touch_suspended;
+	bool proximity_suspended;
 	const struct nvt_ts_mem_map *mmap;
 	uint8_t hw_crc;
 	uint8_t auto_copy;

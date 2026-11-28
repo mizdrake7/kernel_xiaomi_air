@@ -181,9 +181,14 @@ const struct mtk_chip_config spi_ctrdata = {
 #endif
 
 static uint8_t bTouchIsAwake = 0;
+static int32_t nvt_ts_suspend_locked(struct device *dev);
+
 int lct_nvt_tp_proximity_switch_callback(bool flag)
 {
         int rc = 0;
+
+        mutex_lock(&ts->prox_lock);
+        mutex_lock(&ts->lock);
         if (flag) {
                 rc = nvt_set_proximity_switch(1);
                 NVT_LOG("nvt enable proximity mode rc = %d\n",rc);
@@ -191,6 +196,17 @@ int lct_nvt_tp_proximity_switch_callback(bool flag)
                 rc = nvt_set_proximity_switch(0);
                 NVT_LOG("nvt disable proximity mode rc = %d\n",rc);
         }
+        mutex_unlock(&ts->lock);
+
+        if (!flag && !bTouchIsAwake && ts->proximity_suspended) {
+                ts->proximity_suspended = false;
+                mutex_lock(&ts->lock);
+                nvt_set_proximity_power_saving_switch(0);
+                bTouchIsAwake = 1;
+                mutex_unlock(&ts->lock);
+                nvt_ts_suspend_locked(&ts->client->dev);
+        }
+        mutex_unlock(&ts->prox_lock);
         return 0;
 }
 #if WAKEUP_GESTURE
@@ -2335,6 +2351,7 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 
 	mutex_init(&ts->lock);
 	mutex_init(&ts->xbuf_lock);
+	mutex_init(&ts->prox_lock);
 
 	//---eng reset before TP_RESX high
 	nvt_eng_reset();
@@ -2752,6 +2769,7 @@ err_input_register_device_failed:
 	}
 err_input_dev_alloc_failed:
 err_chipvertrim_failed:
+	mutex_destroy(&ts->prox_lock);
 	mutex_destroy(&ts->xbuf_lock);
 	mutex_destroy(&ts->lock);
 	nvt_gpio_deconfig(ts);
@@ -2856,6 +2874,7 @@ uninit_lct_tp_info();
 	nvt_irq_enable(false);
 	free_irq(client->irq, ts);
 
+	mutex_destroy(&ts->prox_lock);
 	mutex_destroy(&ts->xbuf_lock);
 	mutex_destroy(&ts->lock);
 
@@ -2955,7 +2974,7 @@ Description:
 return:
 	Executive outcomes. 0---succeed.
 *******************************************************/
-static int32_t nvt_ts_suspend(struct device *dev)
+static int32_t nvt_ts_suspend_locked(struct device *dev)
 {
 	uint8_t buf[4] = {0};
 #if MT_PROTOCOL_B
@@ -2996,6 +3015,8 @@ if (!ts->is_gesture_mode) {
 
 	NVT_LOG("start\n");
 
+	ts->proximity_suspended = false;
+	ts->touch_suspended = true;
 	bTouchIsAwake = 0;
 
 #if WAKEUP_GESTURE
@@ -3062,6 +3083,17 @@ if (!ts->is_gesture_mode) {
 	return 0;
 }
 
+static int32_t nvt_ts_suspend(struct device *dev)
+{
+	int32_t ret;
+
+	mutex_lock(&ts->prox_lock);
+	ret = nvt_ts_suspend_locked(dev);
+	mutex_unlock(&ts->prox_lock);
+
+	return ret;
+}
+
 /*******************************************************
 Description:
 	Novatek touchscreen driver resume function.
@@ -3071,8 +3103,10 @@ return:
 *******************************************************/
 static int32_t nvt_ts_resume(struct device *dev)
 {
+	mutex_lock(&ts->prox_lock);
 	if (bTouchIsAwake && !proximity_event) {
 		NVT_LOG("Touch is already resume\n");
+		mutex_unlock(&ts->prox_lock);
 		return 0;
 	}
 
@@ -3110,6 +3144,8 @@ static int32_t nvt_ts_resume(struct device *dev)
 			msecs_to_jiffies(NVT_TOUCH_ESD_CHECK_PERIOD));
 #endif /* #if NVT_TOUCH_ESD_PROTECT */
 
+	ts->proximity_suspended = false;
+	ts->touch_suspended = false;
 	bTouchIsAwake = 1;
 	msleep(50);
 	if(proximity_event) {
@@ -3142,6 +3178,7 @@ static int32_t nvt_ts_resume(struct device *dev)
 		g_touchscreen_usb_pulgin.event_callback();
 #endif
 
+	mutex_unlock(&ts->prox_lock);
 	NVT_LOG("end\n");
 
 	return 0;
@@ -3394,14 +3431,35 @@ static int nvt_mtk_drm_notifier_callback(struct notifier_block *nb,
     flush_workqueue(ts->resume_wq);
     if (event == MTK_DISP_EARLY_EVENT_BLANK) {
         if (*blank == MTK_DISP_BLANK_POWERDOWN) {
+			mutex_lock(&ts->prox_lock);
 			NVT_LOG("event=%lu, *blank=%d\n", event, *blank);
 			NVT_LOG("proximity_event = %d\n", proximity_event);
-			/*
-			 * Keyguard disables virtual proximity right before blanking, while
-			 * nvt_set_proximity_switch(0) sleeps before clearing proximity_event.
-			 * Always suspend so gesture wake mode is armed on display off.
-			 */
-			nvt_ts_suspend(&ts->client->dev);
+			if (!proximity_event) {
+				nvt_ts_suspend_locked(&ts->client->dev);
+			} else if (bTouchIsAwake) {
+#if MT_PROTOCOL_B
+				uint32_t i = 0;
+#endif
+				ts->proximity_suspended = true;
+				mutex_lock(&ts->lock);
+				nvt_set_proximity_power_saving_switch(1);
+				bTouchIsAwake = 0;
+				mutex_unlock(&ts->lock);
+#if MT_PROTOCOL_B
+				for (i = 0; i < ts->max_touch_num; i++) {
+					input_mt_slot(ts->input_dev, i);
+					input_report_abs(ts->input_dev, ABS_MT_TOUCH_MAJOR, 0);
+					input_report_abs(ts->input_dev, ABS_MT_PRESSURE, 0);
+					input_mt_report_slot_state(ts->input_dev, MT_TOOL_FINGER, 0);
+				}
+#endif
+				input_report_key(ts->input_dev, BTN_TOUCH, 0);
+#if !MT_PROTOCOL_B
+				input_mt_sync(ts->input_dev);
+#endif
+				input_sync(ts->input_dev);
+			}
+			mutex_unlock(&ts->prox_lock);
         }
 	} else if (event == MTK_DISP_EVENT_BLANK) {
 		if (*blank == MTK_DISP_BLANK_UNBLANK) {

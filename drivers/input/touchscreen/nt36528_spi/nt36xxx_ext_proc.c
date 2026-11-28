@@ -1230,8 +1230,38 @@ int32_t nvt_set_proximity_switch(uint8_t proximity_switch)
 	if (tp_sensor_probe_switch == true) {
 	if ((ts->sensor_tp_fw_status == true) && (ts->sensor_tp_probe_status == true))
 	{
+		bool keep_high;
+
 		NVT_LOG("sensor_tp_probe_status_switch = %d\n",ts->sensor_tp_probe_status);
 		NVT_LOG("sensor_tp_fw_status_switch = %d\n",ts->sensor_tp_fw_status);
+
+		if (proximity_switch == 0) {
+			keep_high = false;
+			proximity_event = 0;
+		} else if (proximity_switch == 1) {
+			keep_high = true;
+			proximity_event = 1;
+		} else {
+			NVT_ERR("Invalid value! proximity_switch = %d\n", proximity_switch);
+			ret = -EINVAL;
+			goto out;
+		}
+
+		if (tp_lcmname == 1) {
+			NVT_LOG("tp_lcmname = %d\n", tp_lcmname);
+			set_prox_lcd_reset_gpio_keep_high(keep_high);
+		} else if (tp_lcmname == 3) {
+			NVT_LOG("tp_lcmname = %d\n", tp_lcmname);
+			set_prox_lcd_reset_gpio_keep_high_c(keep_high);
+		} else {
+			NVT_LOG("tp_lcmname = %d\n", tp_lcmname);
+			return 0;
+		}
+
+		if (ts->touch_suspended) {
+			NVT_LOG("touch is suspended, skip proximity SPI cmd (%d)\n", proximity_switch);
+			return 0;
+		}
 
 	msleep(35);
 
@@ -1244,38 +1274,7 @@ int32_t nvt_set_proximity_switch(uint8_t proximity_switch)
 
 	for (i = 0; i < retry; i++) {
 		buf[0] = EVENT_MAP_HOST_CMD;
-		if (proximity_switch == 0) {
-			// proximity disable
-			if(tp_lcmname == 1) {
-				NVT_LOG("tp_lcmname = %d\n",tp_lcmname);
-				set_prox_lcd_reset_gpio_keep_high(false);
-			} else if (tp_lcmname == 3) {
-				NVT_LOG("tp_lcmname = %d\n",tp_lcmname);
-				set_prox_lcd_reset_gpio_keep_high_c(false);
-			} else {
-				NVT_LOG("tp_lcmname = %d\n",tp_lcmname);
-				return 0;
-			}
-			proximity_event = 0;
-			buf[1] = 0x86;
-		} else if (proximity_switch == 1) {
-			// proximity enable
-			if(tp_lcmname == 1) {
-				set_prox_lcd_reset_gpio_keep_high(true);
-			} else if (tp_lcmname == 3) {
-                                NVT_LOG("tp_lcmname = %d\n",tp_lcmname);
-                                set_prox_lcd_reset_gpio_keep_high_c(true);
-                        } else {
-                                NVT_LOG("tp_lcmname = %d\n",tp_lcmname);
-                                return 0;
-                        }
-			proximity_event = 1;
-			buf[1] = 0x85;
-		} else {
-			NVT_ERR("Invalid value! proximity_switch = %d\n", proximity_switch);
-			ret = -EINVAL;
-			goto out;
-		}
+		buf[1] = proximity_switch ? 0x85 : 0x86;
 		ret = CTP_SPI_WRITE(ts->client, buf, 2);
 		if (ret < 0) {
 			NVT_ERR("Write command fail!\n");
